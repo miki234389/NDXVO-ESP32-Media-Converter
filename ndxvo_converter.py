@@ -50,7 +50,12 @@ except ImportError:  # pragma: no cover
 # --------------------------------------------------------------------------
 
 APP_TITLE = "NDXVO ESP32 File Converter"
-APP_VERSION = "1.0.0"
+
+# The release workflow rewrites the line below in place, so it must stay exactly
+# in the form  APP_VERSION = "<value>"  on a single line. The "-dev" default is
+# what a run straight from source reports, which keeps it visibly distinct from
+# a build produced by CI.
+APP_VERSION = "1.0.0-dev"
 
 OUT_W, OUT_H = 172, 320  # forced device resolution
 
@@ -842,7 +847,7 @@ class App(tk.Tk):
 
     def __init__(self):
         tk.Tk.__init__(self)
-        self.title(APP_TITLE)
+        self.title("%s   v%s" % (APP_TITLE, APP_VERSION))
         self.geometry("1220x880")
         self.minsize(1140, 840)
 

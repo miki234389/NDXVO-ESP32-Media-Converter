@@ -4,6 +4,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to stamp into the app — MAJOR.MINOR.PATCH, optionally with a pre-release suffix. Examples: 1.0.0, 1.2.3, 2.0.0-rc1, 1.4.0-beta.2. Do NOT put a leading "v".'
+        required: true
+        default: "1.0.0"
 
 env:
   APP_NAME: "NDXVO ESP32 File Converter"
@@ -23,6 +28,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: bash .github/scripts/resolve-version.sh
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+
+      - name: Stamp the version into the app
+        shell: bash
+        run: python .github/scripts/stamp_version.py "${{ steps.ver.outputs.version }}"
 
       - name: Install build dependencies
         run: |
@@ -46,6 +62,15 @@ jobs:
             --hidden-import "PIL._tkinter_finder" \
             ndxvo_converter.py
 
+      - name: Write the version into Info.plist
+        # Must happen before signing - editing a bundle invalidates its signature.
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          PLIST="dist/$APP_NAME.app/Contents/Info.plist"
+          plutil -replace CFBundleShortVersionString -string "$V" "$PLIST"
+          plutil -replace CFBundleVersion -string "$V" "$PLIST"
+          plutil -p "$PLIST" | grep -i bundle
+
       - name: Ad-hoc sign the bundle
         # Without a signature macOS refuses to launch an app that contains an
         # unsigned helper binary.  This is not notarisation - see the README for
@@ -56,15 +81,16 @@ jobs:
 
       - name: Package as .dmg
         run: |
+          V="${{ steps.ver.outputs.version }}"
           mkdir -p dmg
           cp -R "dist/$APP_NAME.app" dmg/
           ln -s /Applications "dmg/Applications"
           hdiutil create -volname "$APP_NAME" -srcfolder dmg -ov -format UDZO \
-            "NDXVO-ESP32-File-Converter-macOS-arm64.dmg"
+            "NDXVO-ESP32-File-Converter-$V-macOS-arm64.dmg"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: macos-arm64-dmg
+          name: macos-arm64-dmg-${{ steps.ver.outputs.version }}
           path: "*.dmg"
 
       - name: Attach to release
@@ -83,6 +109,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: bash .github/scripts/resolve-version.sh
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+
+      - name: Stamp the version into the app
+        shell: bash
+        run: python .github/scripts/stamp_version.py "${{ steps.ver.outputs.version }}"
 
       - name: Install build dependencies
         run: |
@@ -104,12 +141,14 @@ jobs:
             ndxvo_converter.py
 
       - name: Rename artifact
+        shell: bash
         run: |
-          Move-Item "dist\$env:APP_NAME.exe" "NDXVO-ESP32-File-Converter-Windows-x64.exe"
+          mv "dist/$APP_NAME.exe" \
+             "NDXVO-ESP32-File-Converter-${{ steps.ver.outputs.version }}-Windows-x64.exe"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: windows-x64-exe
+          name: windows-x64-exe-${{ steps.ver.outputs.version }}
           path: "*.exe"
 
       - name: Attach to release

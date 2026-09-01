@@ -59,21 +59,42 @@ You can also pass a file on the command line: `python ndxvo_converter.py clip.mp
 
 ## Building the binaries
 
-Push a tag (or run the workflow manually) and GitHub Actions builds both
-targets, each with a static ffmpeg baked in so end users install nothing:
+Every build carries an explicit version, supplied one of two ways.
+
+**Manual run** — GitHub → **Actions** → **Build** → **Run workflow**. Fill in the
+`version` field, e.g. `1.2.0`. Artifacts are attached to the workflow run; no
+release is created. Use this to test a build.
+
+**Tag push** — the version comes from the tag, with the leading `v` stripped, and
+the artifacts are also attached to a GitHub Release:
 
 ```
 git tag v1.0.0
 git push origin v1.0.0
 ```
 
+Accepted format is `MAJOR.MINOR.PATCH` with an optional pre-release suffix —
+`1.0.0`, `2.1.3`, `1.4.0-rc1`, `1.4.0-beta.2`. Anything else fails the build
+immediately with a clear message, rather than producing a mislabelled binary.
+
+The version is written into `APP_VERSION` in the source before packaging, shown
+in the app's title bar, embedded in the artifact filenames, and (on macOS)
+written into `CFBundleShortVersionString` so Finder's Get Info reports it. A run
+straight from source reports `1.0.0-dev`, so an unpackaged build is never
+mistaken for a release.
+
 | Target | Runner | Output |
 |---|---|---|
-| macOS, Apple Silicon | `macos-14` (arm64) | `NDXVO-ESP32-File-Converter-macOS-arm64.dmg` |
-| Windows x64 | `windows-latest` | `NDXVO-ESP32-File-Converter-Windows-x64.exe` |
+| macOS, Apple Silicon | `macos-14` (arm64) | `NDXVO-ESP32-File-Converter-<version>-macOS-arm64.dmg` |
+| Windows x64 | `windows-latest` | `NDXVO-ESP32-File-Converter-<version>-Windows-x64.exe` |
 
-Artifacts are uploaded to the workflow run, and attached to a GitHub Release
-when the build was triggered by a tag.
+Each target bundles a static ffmpeg, so end users install nothing.
+
+Two helper scripts keep the logic out of the YAML, where it can be run and
+tested locally:
+
+- `.github/scripts/resolve-version.sh` — picks the version and validates it
+- `.github/scripts/stamp_version.py` — rewrites `APP_VERSION` and verifies the result
 
 ### First launch on macOS
 
