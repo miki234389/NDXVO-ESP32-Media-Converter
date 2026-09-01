@@ -1,0 +1,119 @@
+name: Build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  APP_NAME: "NDXVO ESP32 File Converter"
+  PYTHON_VERSION: "3.12"
+  # Static ffmpeg comes from the imageio-ffmpeg wheels: one pinned version,
+  # native binaries for both targets, no scraping of ad-hoc download pages.
+  IMAGEIO_FFMPEG_VERSION: "0.6.0"
+
+jobs:
+  # ---------------------------------------------------------------- macOS ---
+  macos:
+    name: macOS (Apple Silicon)
+    runs-on: macos-14          # arm64 runner
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pillow pyinstaller "imageio-ffmpeg==${IMAGEIO_FFMPEG_VERSION}"
+
+      - name: Extract the static ffmpeg binary
+        run: |
+          FF="$(python -c 'import imageio_ffmpeg, sys; sys.stdout.write(imageio_ffmpeg.get_ffmpeg_exe())')"
+          cp "$FF" ./ffmpeg
+          chmod +x ./ffmpeg
+          file ./ffmpeg
+          ./ffmpeg -version | head -1
+
+      - name: Build the .app bundle
+        run: |
+          pyinstaller --noconfirm --clean --windowed --onedir \
+            --name "$APP_NAME" \
+            --osx-bundle-identifier "net.ndxvo.esp32converter" \
+            --add-binary "ffmpeg:." \
+            --hidden-import "PIL._tkinter_finder" \
+            ndxvo_converter.py
+
+      - name: Ad-hoc sign the bundle
+        # Without a signature macOS refuses to launch an app that contains an
+        # unsigned helper binary.  This is not notarisation - see the README for
+        # the one-off quarantine step users need on first launch.
+        run: |
+          codesign --force --deep --sign - "dist/$APP_NAME.app"
+          codesign --verify --deep --strict --verbose=2 "dist/$APP_NAME.app"
+
+      - name: Package as .dmg
+        run: |
+          mkdir -p dmg
+          cp -R "dist/$APP_NAME.app" dmg/
+          ln -s /Applications "dmg/Applications"
+          hdiutil create -volname "$APP_NAME" -srcfolder dmg -ov -format UDZO \
+            "NDXVO-ESP32-File-Converter-macOS-arm64.dmg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64-dmg
+          path: "*.dmg"
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "*.dmg"
+
+  # -------------------------------------------------------------- Windows ---
+  windows:
+    name: Windows (x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pillow pyinstaller "imageio-ffmpeg==$env:IMAGEIO_FFMPEG_VERSION"
+
+      - name: Extract the static ffmpeg binary
+        run: |
+          $ff = python -c "import imageio_ffmpeg, sys; sys.stdout.write(imageio_ffmpeg.get_ffmpeg_exe())"
+          Copy-Item $ff .\ffmpeg.exe
+          .\ffmpeg.exe -version | Select-Object -First 1
+
+      - name: Build the .exe
+        run: |
+          pyinstaller --noconfirm --clean --windowed --onefile `
+            --name "$env:APP_NAME" `
+            --add-binary "ffmpeg.exe;." `
+            --hidden-import "PIL._tkinter_finder" `
+            ndxvo_converter.py
+
+      - name: Rename artifact
+        run: |
+          Move-Item "dist\$env:APP_NAME.exe" "NDXVO-ESP32-File-Converter-Windows-x64.exe"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-exe
+          path: "*.exe"
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "*.exe"
