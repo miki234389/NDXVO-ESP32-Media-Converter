@@ -9,6 +9,13 @@ on:
         description: 'Version to stamp into the app — MAJOR.MINOR.PATCH, optionally with a pre-release suffix. Examples: 1.0.0, 1.2.3, 2.0.0-rc1, 1.4.0-beta.2. Do NOT put a leading "v".'
         required: true
         default: "1.0.0"
+      release:
+        description: "Also tag this commit as v<version> and publish a GitHub Release. Leave off for a test build."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
 
 env:
   APP_NAME: "NDXVO ESP32 File Converter"
@@ -18,16 +25,18 @@ env:
   IMAGEIO_FFMPEG_VERSION: "0.6.0"
 
 jobs:
-  # ---------------------------------------------------------------- macOS ---
-  macos:
-    name: macOS (Apple Silicon)
-    runs-on: macos-14          # arm64 runner
+  # ------------------------------------------------------------ preflight ---
+  # Resolve the version once, so both build jobs are guaranteed to stamp the
+  # same value, and so a malformed version or an already-taken tag fails in
+  # seconds instead of after a full build.
+  preflight:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      release: ${{ steps.mode.outputs.release }}
     steps:
       - uses: actions/checkout@v6
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Resolve version
         id: ver
@@ -36,9 +45,47 @@ jobs:
         env:
           INPUT_VERSION: ${{ inputs.version }}
 
+      - name: Decide whether this run publishes
+        id: mode
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "Tag push — the tag already exists, a Release will be published."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ inputs.release }}" = "true" ]; then
+            echo "Manual run with 'release' ticked — a tag will be created and a Release published."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Test build — artifacts only, no tag and no Release."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Make sure the tag is still free
+        if: github.event_name == 'workflow_dispatch' && inputs.release
+        shell: bash
+        run: |
+          TAG="v${{ steps.ver.outputs.version }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "::error::Tag $TAG already exists. Choose a different version, or delete the existing tag first."
+            exit 1
+          fi
+          echo "Tag $TAG is free."
+
+  # ---------------------------------------------------------------- macOS ---
+  macos:
+    name: macOS (Apple Silicon)
+    needs: preflight
+    runs-on: macos-14          # arm64 runner
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
       - name: Stamp the version into the app
         shell: bash
-        run: python .github/scripts/stamp_version.py "${{ steps.ver.outputs.version }}"
+        run: python .github/scripts/stamp_version.py "${{ needs.preflight.outputs.version }}"
 
       - name: Install build dependencies
         run: |
@@ -66,7 +113,7 @@ jobs:
       - name: Write the version into Info.plist
         # Must happen before signing - editing a bundle invalidates its signature.
         run: |
-          V="${{ steps.ver.outputs.version }}"
+          V="${{ needs.preflight.outputs.version }}"
           PLIST="dist/$APP_NAME.app/Contents/Info.plist"
           plutil -replace CFBundleShortVersionString -string "$V" "$PLIST"
           plutil -replace CFBundleVersion -string "$V" "$PLIST"
@@ -82,7 +129,7 @@ jobs:
 
       - name: Package as .dmg
         run: |
-          V="${{ steps.ver.outputs.version }}"
+          V="${{ needs.preflight.outputs.version }}"
           mkdir -p dmg out
           cp -R "dist/$APP_NAME.app" dmg/
           ln -s /Applications "dmg/Applications"
@@ -92,20 +139,15 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: macos-arm64-dmg-${{ steps.ver.outputs.version }}
+          name: macos-arm64-dmg-${{ needs.preflight.outputs.version }}
           path: "out/*.dmg"
           # exactly one file per build, so hand it over as-is instead of a zip
           archive: false
 
-      - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v3
-        with:
-          files: "out/*.dmg"
-
   # -------------------------------------------------------------- Windows ---
   windows:
     name: Windows (x64)
+    needs: preflight
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -114,16 +156,9 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Resolve version
-        id: ver
-        shell: bash
-        run: bash .github/scripts/resolve-version.sh
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
-
       - name: Stamp the version into the app
         shell: bash
-        run: python .github/scripts/stamp_version.py "${{ steps.ver.outputs.version }}"
+        run: python .github/scripts/stamp_version.py "${{ needs.preflight.outputs.version }}"
 
       - name: Install build dependencies
         run: |
@@ -150,18 +185,52 @@ jobs:
         run: |
           mkdir -p out
           mv "dist/$APP_NAME.exe" \
-             "out/NDXVO-ESP32-File-Converter-${{ steps.ver.outputs.version }}-Windows-x64.exe"
+             "out/NDXVO-ESP32-File-Converter-${{ needs.preflight.outputs.version }}-Windows-x64.exe"
           ls -la out/
 
       - uses: actions/upload-artifact@v7
         with:
-          name: windows-x64-exe-${{ steps.ver.outputs.version }}
+          name: windows-x64-exe-${{ needs.preflight.outputs.version }}
           path: "out/*.exe"
           # exactly one file per build, so hand it over as-is instead of a zip
           archive: false
 
-      - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/')
+  # -------------------------------------------------------------- release ---
+  # Runs only after BOTH builds succeed, so a tag is never created for a version
+  # that failed to build on one of the platforms.
+  release:
+    name: Tag and publish
+    needs: [preflight, macos, windows]
+    if: needs.preflight.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v7
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Show what will be published
+        run: ls -la assets
+
+      - name: Create the tag
+        # On a tag push the tag already exists; only a manual run creates one.
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          TAG="v${{ needs.preflight.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+          echo "Created and pushed $TAG at ${{ github.sha }}"
+
+      - name: Publish the release
         uses: softprops/action-gh-release@v3
         with:
-          files: "out/*.exe"
+          tag_name: "v${{ needs.preflight.outputs.version }}"
+          name: "v${{ needs.preflight.outputs.version }}"
+          files: assets/*
+          fail_on_unmatched_files: true

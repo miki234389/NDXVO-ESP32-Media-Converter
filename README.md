@@ -59,19 +59,19 @@ You can also pass a file on the command line: `python ndxvo_converter.py clip.mp
 
 ## Building the binaries
 
-Every build carries an explicit version, supplied one of two ways.
+Every build carries an explicit version. There are three ways to run it.
 
-**Manual run** — GitHub → **Actions** → **Build** → **Run workflow**. Fill in the
-`version` field, e.g. `1.2.0`. Artifacts are attached to the workflow run; no
-release is created. Use this to test a build.
+**Test build** — Actions → **Build** → **Run workflow**. Fill in `version`, leave
+`release` unticked. You get artifacts on the run page; no tag, no Release. Use
+this while iterating.
 
-**Tag push** — the version comes from the tag, with the leading `v` stripped, and
-the artifacts are also attached to a GitHub Release:
+**Release from the button** — same form, but tick `release`. On success the
+workflow tags the built commit as `v<version>` and publishes a GitHub Release
+with both binaries attached. This is the normal way to cut a release: one field
+and one checkbox, no local tagging.
 
-```
-git tag v1.0.0
-git push origin v1.0.0
-```
+**Release from a tag** — push `v1.2.0` yourself and the same thing happens, with
+the version taken from the tag name.
 
 Accepted format is `MAJOR.MINOR.PATCH` with an optional pre-release suffix —
 `1.0.0`, `2.1.3`, `1.4.0-rc1`, `1.4.0-beta.2`. Anything else fails the build
@@ -83,26 +83,41 @@ written into `CFBundleShortVersionString` so Finder's Get Info reports it. A run
 straight from source reports `1.0.0-dev`, so an unpackaged build is never
 mistaken for a release.
 
+### Job layout
+
+```
+preflight ──┬── macos ───┐
+            └── windows ─┴── release   (only if this run publishes)
+```
+
+`preflight` resolves and validates the version once and hands it to both build
+jobs, so the two binaries can never disagree about what they are. When the run
+is going to publish, it also checks up front that the tag is still free — that
+failure arrives in seconds rather than after a full build.
+
+`release` runs only after **both** builds succeed, so a tag never points at a
+version that failed to build on one platform.
+
+The tag is pushed with `GITHUB_TOKEN`, and GitHub deliberately does not start new
+workflow runs for such pushes. That is what stops the tag-push trigger from
+firing a second, duplicate build.
+
 | Target | Runner | Output |
 |---|---|---|
 | macOS, Apple Silicon | `macos-14` (arm64) | `NDXVO-ESP32-File-Converter-<version>-macOS-arm64.dmg` |
 | Windows x64 | `windows-latest` | `NDXVO-ESP32-File-Converter-<version>-Windows-x64.exe` |
 
-Each target bundles a static ffmpeg, so end users install nothing.
+Each target bundles a static ffmpeg, so end users install nothing. ffmpeg is
+staged into `vendor/` and finished binaries into `out/`, so the upload globs
+cannot pick up build inputs by accident.
 
 Artifacts are uploaded with `archive: false`, so the download is the `.dmg` or
 `.exe` itself rather than a zip wrapping it. This works because each job
 produces exactly one file — if a build ever emits more than one, the upload
 step fails rather than silently re-zipping.
 
-Artifacts on a manual run are kept for 90 days and need a GitHub login to
-download. Release assets from a tag push are permanent and directly linkable.
-
-Two helper scripts keep the logic out of the YAML, where it can be run and
-tested locally:
-
-- `.github/scripts/resolve-version.sh` — picks the version and validates it
-- `.github/scripts/stamp_version.py` — rewrites `APP_VERSION` and verifies the result
+Artifacts on a test build are kept for 90 days and need a GitHub login to
+download. Release assets are permanent and directly linkable.
 
 ### First launch on macOS
 
