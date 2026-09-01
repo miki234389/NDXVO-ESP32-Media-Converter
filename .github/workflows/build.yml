@@ -48,17 +48,18 @@ jobs:
       - name: Extract the static ffmpeg binary
         run: |
           FF="$(python -c 'import imageio_ffmpeg, sys; sys.stdout.write(imageio_ffmpeg.get_ffmpeg_exe())')"
-          cp "$FF" ./ffmpeg
-          chmod +x ./ffmpeg
-          file ./ffmpeg
-          ./ffmpeg -version | head -1
+          mkdir -p vendor
+          cp "$FF" vendor/ffmpeg
+          chmod +x vendor/ffmpeg
+          file vendor/ffmpeg
+          vendor/ffmpeg -version | head -1
 
       - name: Build the .app bundle
         run: |
           pyinstaller --noconfirm --clean --windowed --onedir \
             --name "$APP_NAME" \
             --osx-bundle-identifier "net.ndxvo.esp32converter" \
-            --add-binary "ffmpeg:." \
+            --add-binary "vendor/ffmpeg:." \
             --hidden-import "PIL._tkinter_finder" \
             ndxvo_converter.py
 
@@ -82,16 +83,17 @@ jobs:
       - name: Package as .dmg
         run: |
           V="${{ steps.ver.outputs.version }}"
-          mkdir -p dmg
+          mkdir -p dmg out
           cp -R "dist/$APP_NAME.app" dmg/
           ln -s /Applications "dmg/Applications"
           hdiutil create -volname "$APP_NAME" -srcfolder dmg -ov -format UDZO \
-            "NDXVO-ESP32-File-Converter-$V-macOS-arm64.dmg"
+            "out/NDXVO-ESP32-File-Converter-$V-macOS-arm64.dmg"
+          ls -la out/
 
       - uses: actions/upload-artifact@v7
         with:
           name: macos-arm64-dmg-${{ steps.ver.outputs.version }}
-          path: "*.dmg"
+          path: "out/*.dmg"
           # exactly one file per build, so hand it over as-is instead of a zip
           archive: false
 
@@ -99,7 +101,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v3
         with:
-          files: "*.dmg"
+          files: "out/*.dmg"
 
   # -------------------------------------------------------------- Windows ---
   windows:
@@ -131,27 +133,30 @@ jobs:
       - name: Extract the static ffmpeg binary
         run: |
           $ff = python -c "import imageio_ffmpeg, sys; sys.stdout.write(imageio_ffmpeg.get_ffmpeg_exe())"
-          Copy-Item $ff .\ffmpeg.exe
-          .\ffmpeg.exe -version | Select-Object -First 1
+          New-Item -ItemType Directory -Force -Path vendor | Out-Null
+          Copy-Item $ff vendor\ffmpeg.exe
+          .\vendor\ffmpeg.exe -version | Select-Object -First 1
 
       - name: Build the .exe
         run: |
           pyinstaller --noconfirm --clean --windowed --onefile `
             --name "$env:APP_NAME" `
-            --add-binary "ffmpeg.exe;." `
+            --add-binary "vendor/ffmpeg.exe;." `
             --hidden-import "PIL._tkinter_finder" `
             ndxvo_converter.py
 
-      - name: Rename artifact
+      - name: Collect the artifact
         shell: bash
         run: |
+          mkdir -p out
           mv "dist/$APP_NAME.exe" \
-             "NDXVO-ESP32-File-Converter-${{ steps.ver.outputs.version }}-Windows-x64.exe"
+             "out/NDXVO-ESP32-File-Converter-${{ steps.ver.outputs.version }}-Windows-x64.exe"
+          ls -la out/
 
       - uses: actions/upload-artifact@v7
         with:
           name: windows-x64-exe-${{ steps.ver.outputs.version }}
-          path: "*.exe"
+          path: "out/*.exe"
           # exactly one file per build, so hand it over as-is instead of a zip
           archive: false
 
@@ -159,4 +164,4 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v3
         with:
-          files: "*.exe"
+          files: "out/*.exe"
