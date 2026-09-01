@@ -90,6 +90,14 @@ mistaken for a release.
 
 Each target bundles a static ffmpeg, so end users install nothing.
 
+Artifacts are uploaded with `archive: false`, so the download is the `.dmg` or
+`.exe` itself rather than a zip wrapping it. This works because each job
+produces exactly one file — if a build ever emits more than one, the upload
+step fails rather than silently re-zipping.
+
+Artifacts on a manual run are kept for 90 days and need a GitHub login to
+download. Release assets from a tag push are permanent and directly linkable.
+
 Two helper scripts keep the logic out of the YAML, where it can be run and
 tested locally:
 

@@ -23,9 +23,9 @@ jobs:
     name: macOS (Apple Silicon)
     runs-on: macos-14          # arm64 runner
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
@@ -88,14 +88,16 @@ jobs:
           hdiutil create -volname "$APP_NAME" -srcfolder dmg -ov -format UDZO \
             "NDXVO-ESP32-File-Converter-$V-macOS-arm64.dmg"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos-arm64-dmg-${{ steps.ver.outputs.version }}
           path: "*.dmg"
+          # exactly one file per build, so hand it over as-is instead of a zip
+          archive: false
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: "*.dmg"
 
@@ -104,9 +106,9 @@ jobs:
     name: Windows (x64)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
@@ -146,13 +148,15 @@ jobs:
           mv "dist/$APP_NAME.exe" \
              "NDXVO-ESP32-File-Converter-${{ steps.ver.outputs.version }}-Windows-x64.exe"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows-x64-exe-${{ steps.ver.outputs.version }}
           path: "*.exe"
+          # exactly one file per build, so hand it over as-is instead of a zip
+          archive: false
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: "*.exe"
