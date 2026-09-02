@@ -18,7 +18,7 @@ permissions:
   contents: read
 
 env:
-  APP_NAME: "NDXVO ESP32 File Converter"
+  APP_NAME: "NDXVO Media Converter"
   PYTHON_VERSION: "3.12"
   # Static ffmpeg comes from the imageio-ffmpeg wheels: one pinned version,
   # native binaries for both targets, no scraping of ad-hoc download pages.
@@ -134,7 +134,7 @@ jobs:
           cp -R "dist/$APP_NAME.app" dmg/
           ln -s /Applications "dmg/Applications"
           hdiutil create -volname "$APP_NAME" -srcfolder dmg -ov -format UDZO \
-            "out/NDXVO-ESP32-File-Converter-$V-macOS-arm64.dmg"
+            "out/NDXVO-Media-Converter-$V-macOS-arm64.dmg"
           ls -la out/
 
       - name: Verify ffmpeg is inside the .app inside the .dmg
@@ -142,7 +142,7 @@ jobs:
         # shipped, so a build can never be published with ffmpeg missing.
         run: |
           V="${{ needs.preflight.outputs.version }}"
-          DMG="out/NDXVO-ESP32-File-Converter-$V-macOS-arm64.dmg"
+          DMG="out/NDXVO-Media-Converter-$V-macOS-arm64.dmg"
           MP="$(mktemp -d)"
           hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MP"
           FF="$MP/$APP_NAME.app/Contents/Frameworks/ffmpeg"
@@ -203,7 +203,7 @@ jobs:
         run: |
           mkdir -p out
           mv "dist/$APP_NAME.exe" \
-             "out/NDXVO-ESP32-File-Converter-${{ needs.preflight.outputs.version }}-Windows-x64.exe"
+             "out/NDXVO-Media-Converter-${{ needs.preflight.outputs.version }}-Windows-x64.exe"
           ls -la out/
 
       - name: Verify ffmpeg is inside the .exe
@@ -211,7 +211,7 @@ jobs:
         # asserts ffmpeg.exe is one of its entries.
         shell: bash
         run: |
-          EXE="out/NDXVO-ESP32-File-Converter-${{ needs.preflight.outputs.version }}-Windows-x64.exe"
+          EXE="out/NDXVO-Media-Converter-${{ needs.preflight.outputs.version }}-Windows-x64.exe"
           ls -l "$EXE"
           python -m PyInstaller.utils.cliutils.archive_viewer --list --brief "$EXE" \
             | tr ',' '\n' | grep -qi 'ffmpeg\.exe' \

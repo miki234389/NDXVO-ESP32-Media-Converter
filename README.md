@@ -1,4 +1,4 @@
-# NDXVO ESP32 Media Converter
+# NDXVO Media Converter
 
 A single-file GUI that turns any video or still image into an MJPEG-AVI clip an
 ESP32 device with a 172 × 320 panel can play straight from an SD card.
@@ -104,8 +104,8 @@ firing a second, duplicate build.
 
 | Target | Runner | Output |
 |---|---|---|
-| macOS, Apple Silicon | `macos-14` (arm64) | `NDXVO-ESP32-File-Converter-<version>-macOS-arm64.dmg` |
-| Windows x64 | `windows-latest` | `NDXVO-ESP32-File-Converter-<version>-Windows-x64.exe` |
+| macOS, Apple Silicon | `macos-14` (arm64) | `NDXVO-Media-Converter-<version>-macOS-arm64.dmg` |
+| Windows x64 | `windows-latest` | `NDXVO-Media-Converter-<version>-Windows-x64.exe` |
 
 Each target bundles a static ffmpeg, so end users install nothing. ffmpeg is
 staged into `vendor/` and finished binaries into `out/`, so the upload globs
@@ -126,7 +126,7 @@ open it the first time, usually claiming the app "is damaged". It is not. Clear
 the quarantine flag once:
 
 ```
-xattr -dr com.apple.quarantine "/Applications/NDXVO ESP32 File Converter.app"
+xattr -dr com.apple.quarantine "/Applications/NDXVO Media Converter.app"
 ```
 
 After that it opens normally, including after updates.

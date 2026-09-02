@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NDXVO ESP32 File Converter
-==========================
+NDXVO Media Converter
+=====================
 
 Single-file GUI for converting videos / stills into MJPEG-AVI clips that an
 ESP32 device with a 172x320 panel can play straight from an SD card.
@@ -49,7 +49,7 @@ except ImportError:  # pragma: no cover
 # Constants
 # --------------------------------------------------------------------------
 
-APP_TITLE = "NDXVO ESP32 File Converter"
+APP_TITLE = "NDXVO Media Converter"
 
 # The release workflow rewrites the line below in place, so it must stay exactly
 # in the form  APP_VERSION = "<value>"  on a single line. The "-dev" default is
@@ -59,6 +59,14 @@ APP_VERSION = "1.0.0-dev"
 
 OUT_W, OUT_H = 172, 320  # forced device resolution
 
+CROP_LABEL_WIDTH = 7   # characters reserved for the "Crop X" / "Crop Y" labels
+CROP_SLIDER_LEN = 113  # px; two thirds of the original 170 px trough
+CROP_STEP = 0.01       # smallest crop offset step the arrows / keyboard produce
+CROP_REPEAT_DELAY_MS = 400  # hold this long before an arrow starts repeating
+CROP_REPEAT_RATE_MS = 55    # ...then one step every this many ms
+TIME_LABEL_WIDTH = 9    # characters for "mm:ss.mmm"
+TIME_LABEL_WIDTH_H = 11  # ...widened to "h:mm:ss.mmm" for clips over an hour
+
 # Geometry of the embedded device photo (800x800 source), measured against a
 # reference shot of the panel showing a real UI.
 MOCKUP_SCREEN = (297, 227, 207, 385)   # x, y, w, h of the active LCD area
@@ -67,9 +75,23 @@ MOCKUP_CROP = (255, 165, 545, 635)     # visible region of the photo we display
 # This affects the preview only — the encoded video is always a full rectangle.
 CORNER_RADIUS_RATIO = 0.086
 
+# The panel is mounted upside down on the board, which is exactly why the
+# reference command ends in "hflip,vflip": the file has to be pre-rotated so the
+# hardware shows it the right way up.  The preview therefore has to undo that
+# same half turn, otherwise picking the correct 180 setting would make the
+# mock-up look wrong while the device looks right.
+DEVICE_PANEL_ROTATION = 180
+
 FPS_CHOICES = (30, 25)
 ROTATION_CHOICES = (0, 90, 180, 270)
-QUALITY_MIN, QUALITY_MAX = 1, 31       # ffmpeg -q:v range for mjpeg
+# Quality is shown to the user as a plain 1..10 dial, highest = best, because
+# ffmpeg's -q:v runs the other way (2 = near-lossless, 31 = coarse) and that
+# inversion is a constant source of confusion.  The table below is the whole
+# translation: index = level - 1.  Level 9 maps to -q:v 2, which is what the
+# reference command used, so the default matches the known-good output.
+QUALITY_MIN, QUALITY_MAX = 1, 10
+QUALITY_QSCALE = (24, 16, 12, 9, 7, 5, 4, 3, 2, 1)
+QUALITY_DEFAULT = 9
 
 PREVIEW_DEBOUNCE_MS = 150
 STEP_SECONDS = 0.5
@@ -431,6 +453,7 @@ class MediaInfo(object):
         self.ok = False
         self.error = ""
         self.is_image = os.path.splitext(path)[1].lower() in IMAGE_EXTS
+        self.orientation = 1       # EXIF orientation, 1 = stored upright
         self.width = 0
         self.height = 0
         self.duration = 0.0
@@ -445,6 +468,48 @@ class MediaInfo(object):
         if self.is_image:
             return base + "  |  still image"
         return base + "  |  %.3g fps  |  %s" % (self.fps, format_time(self.duration))
+
+
+# EXIF orientation -> the filters that bring stored pixels to display order.
+# ffmpeg's own autorotate is bypassed with -noautorotate and this table is used
+# instead, because whether a build rotates a still is version dependent while
+# ffprobe always reports the *stored* size.  Doing it here keeps the geometry,
+# the two preview panes and the encoded file in agreement on every build.
+EXIF_FILTERS = {
+    1: [],
+    2: ["hflip"],
+    3: ["hflip", "vflip"],
+    4: ["vflip"],
+    5: ["transpose=0"],
+    6: ["transpose=1"],
+    7: ["transpose=3"],
+    8: ["transpose=2"],
+}
+EXIF_SWAPS_AXES = (5, 6, 7, 8)
+
+
+def exif_orientation(path):
+    """EXIF orientation of a still, or 1 when there is none / it is unreadable."""
+    try:
+        with Image.open(path) as im:
+            return int(im.getexif().get(274, 1)) or 1
+    except Exception:
+        return 1
+
+
+def exif_filters(info):
+    if not info.is_image:
+        return []
+    return list(EXIF_FILTERS.get(info.orientation, []))
+
+
+def input_args(info):
+    """Input-side ffmpeg options for this source.
+
+    Stills are read with -noautorotate so the EXIF turn is applied by our own
+    filter chain exactly once, at a point we control.
+    """
+    return ["-noautorotate"] if info.is_image else []
 
 
 _RE_DURATION = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
@@ -496,8 +561,37 @@ def probe(path):
         info.is_image = True
         info.duration = 0.0
 
+    if info.is_image:
+        info.orientation = exif_orientation(path)
+        if info.orientation in EXIF_SWAPS_AXES:
+            # ffprobe reports the stored size; a quarter-turn tag means the
+            # displayed frame is the other way round, and every scale/crop
+            # figure below has to work from the displayed size.
+            info.width, info.height = info.height, info.width
+
     info.ok = True
     return info
+
+
+def qscale_for(level):
+    """Translate the 1..10 quality dial into an ffmpeg -q:v value."""
+    try:
+        level = int(round(float(level)))
+    except (TypeError, ValueError):
+        level = QUALITY_DEFAULT
+    level = max(QUALITY_MIN, min(QUALITY_MAX, level))
+    return QUALITY_QSCALE[level - 1]
+
+
+def format_crop(value):
+    """Crop offset readout: 0.00 is centred, +/-1.00 is hard against an edge."""
+    try:
+        v = round(float(value), 2)
+    except (TypeError, ValueError):
+        return "0.00"
+    if abs(v) < 0.005:
+        return "0.00"
+    return "%+.2f" % v
 
 
 def format_time(seconds):
@@ -518,7 +612,7 @@ class Params(object):
 
     def __init__(self):
         self.fps = 30
-        self.quality = 2
+        self.quality = QUALITY_DEFAULT   # 1..10 dial, not ffmpeg's -q:v
         self.fit = "crop"          # crop | stretch | fit
         self.crop_x = 0.0          # -1 .. +1  (0 = centred)
         self.crop_y = 0.0
@@ -587,20 +681,29 @@ def build_vf(p, info, include_fps=True):
     """
     parts = []
 
+    if info is not None:
+        # Undoes the EXIF tag before anything else, so everything downstream
+        # works on the picture as the user sees it in their photo viewer.
+        parts.extend(exif_filters(info))
+
     if include_fps and info is not None and not info.is_image:
         parts.append("fps=%d" % p.fps)
 
     ops = []
+    flip_h, flip_v = p.mirror_h, p.mirror_v
     if p.rotation == 90:
         ops.append("transpose=1")
     elif p.rotation == 180:
-        ops.append("transpose=1")
-        ops.append("transpose=1")
+        # A 180 turn is hflip+vflip; expressing it that way keeps the chain
+        # short and lets it cancel against the mirror toggles below instead of
+        # emitting a redundant "transpose=1,transpose=1".
+        flip_h = not flip_h
+        flip_v = not flip_v
     elif p.rotation == 270:
         ops.append("transpose=2")
-    if p.mirror_h:
+    if flip_h:
         ops.append("hflip")
-    if p.mirror_v:
+    if flip_v:
         ops.append("vflip")
 
     orientation_last = p.rotation in (0, 180)
@@ -647,11 +750,12 @@ def build_generate_cmd(info, p, out_path):
     vf = build_vf(p, info, include_fps=not info.is_image)
     cmd = [FFMPEG or "ffmpeg", "-y"]
     if info.is_image:
-        cmd += ["-loop", "1", "-framerate", str(p.fps), "-i", info.path,
-                "-t", "%.3f" % p.duration]
+        cmd += ["-loop", "1", "-framerate", str(p.fps)] + input_args(info) + \
+               ["-i", info.path, "-t", "%.3f" % p.duration]
     else:
         cmd += ["-i", info.path]
-    cmd += ["-an", "-pix_fmt", "yuvj420p", "-c:v", "mjpeg", "-q:v", str(p.quality)]
+    cmd += ["-an", "-pix_fmt", "yuvj420p", "-c:v", "mjpeg",
+            "-q:v", str(qscale_for(p.quality))]
     if vf:
         cmd += ["-vf", vf]
     cmd += [out_path]
@@ -735,15 +839,20 @@ class Renderer(threading.Thread):
         return Image.open(io.BytesIO(data)).convert("RGB")
 
     def _extract_original(self, job):
-        key = (job.info.path, round(job.timestamp, 3))
+        key = (job.info.path, job.info.orientation, round(job.timestamp, 3))
         if key == self._orig_cache_key and self._orig_cache_img is not None:
             return self._orig_cache_img
 
         cmd = [FFMPEG, "-hide_banner", "-loglevel", "error"]
         if not job.info.is_image:
             cmd += ["-ss", "%.3f" % job.timestamp]
-        cmd += ["-i", job.info.path, "-frames:v", "1",
-                "-f", "image2pipe", "-vcodec", "png", "-"]
+        cmd += input_args(job.info) + ["-i", job.info.path, "-frames:v", "1"]
+        # The original pane shows the photo the right way up too, so it has to
+        # carry the same EXIF correction the processed chain starts with.
+        orient = ",".join(exif_filters(job.info))
+        if orient:
+            cmd += ["-vf", orient]
+        cmd += ["-f", "image2pipe", "-vcodec", "png", "-"]
         rc, out, err = run_capture(cmd)
         if not out:
             raise RuntimeError(err.strip() or "could not read a frame at this position")
@@ -758,13 +867,13 @@ class Renderer(threading.Thread):
         cmd = [FFMPEG, "-hide_banner", "-loglevel", "error"]
         if not job.info.is_image:
             cmd += ["-ss", "%.3f" % job.timestamp]
-        cmd += ["-i", job.info.path]
+        cmd += input_args(job.info) + ["-i", job.info.path]
         if vf:
             cmd += ["-vf", vf]
         # Same codec and quality as the real export, so the preview shows the
         # actual MJPEG artefacts rather than a clean approximation.
         cmd += ["-frames:v", "1", "-pix_fmt", "yuvj420p",
-                "-c:v", "mjpeg", "-q:v", str(p.quality),
+                "-c:v", "mjpeg", "-q:v", str(qscale_for(p.quality)),
                 "-f", "image2pipe", "-"]
         rc, out, err = run_capture(cmd)
         if not out:
@@ -905,14 +1014,16 @@ class App(tk.Tk):
         self.var_status = tk.StringVar(value="Ready")
         self.var_command = tk.StringVar(value="")
         self.var_timelabel = tk.StringVar(value="00:00.000")
-        self.var_qualitylabel = tk.StringVar(value="2")
+        self.var_crop_x_label = tk.StringVar(value=format_crop(p.crop_x))
+        self.var_crop_y_label = tk.StringVar(value=format_crop(p.crop_y))
+        self.var_qualitylabel = tk.StringVar(value=str(p.quality))
 
         for v in (self.var_fps, self.var_fit, self.var_rotation,
                   self.var_mirror_h, self.var_mirror_v, self.var_duration):
             v.trace_add("write", self._on_param_change)
         self.var_quality.trace_add("write", self._on_quality_change)
-        self.var_crop_x.trace_add("write", self._on_param_change)
-        self.var_crop_y.trace_add("write", self._on_param_change)
+        self.var_crop_x.trace_add("write", self._on_crop_change)
+        self.var_crop_y.trace_add("write", self._on_crop_change)
 
     # -- layout ------------------------------------------------------------
 
@@ -922,6 +1033,13 @@ class App(tk.Tk):
             if theme in style.theme_names():
                 style.theme_use(theme)
                 break
+        # A readonly combobox keeps black text when disabled under most themes,
+        # which makes it look active while the rest of the panel is greyed out.
+        style.map("TCombobox",
+                  foreground=[("disabled", "#9a9a9a")],
+                  fieldbackground=[("disabled", "#ebebeb")],
+                  background=[("disabled", "#ebebeb")],
+                  arrowcolor=[("disabled", "#9a9a9a")])
         style.configure("Hint.TLabel", foreground="#666666")
         style.configure("Head.TLabel", font=("TkDefaultFont", 10, "bold"))
 
@@ -949,6 +1067,7 @@ class App(tk.Tk):
         self._build_preview_pane(mid)
         self._build_device_pane(mid)
         self._build_controls(mid)
+        self._build_timeline(mid)
 
         # --- bottom ---
         self._build_bottom(root)
@@ -976,6 +1095,7 @@ class App(tk.Tk):
     def _build_controls(self, parent):
         c = ttk.Frame(parent)
         c.grid(row=0, column=2, sticky="ns")
+        self.ctrl_frame = c
         r = 0
 
         ttk.Label(c, text="Fit mode", style="Head.TLabel")\
@@ -986,19 +1106,65 @@ class App(tk.Tk):
             ttk.Radiobutton(c, text=label, value=value, variable=self.var_fit)\
                 .grid(row=r, column=0, columnspan=2, sticky="w", padx=(10, 0)); r += 1
 
+        # The crop controls live in their own grid so the label, the trough and
+        # the numeric readout line up across both rows, and so "Centre crop"
+        # can be centred on the trough column.
+        cropf = ttk.Frame(c)
+        cropf.grid(row=r, column=0, columnspan=2, sticky="w", padx=(10, 0)); r += 1
         self.crop_widgets = []
-        for label, var in (("Crop X", self.var_crop_x), ("Crop Y", self.var_crop_y)):
-            lbl = ttk.Label(c, text=label)
-            lbl.grid(row=r, column=0, sticky="w", padx=(10, 6), pady=(4, 0))
-            sc = ttk.Scale(c, from_=-1.0, to=1.0, variable=var,
-                           orient="horizontal", length=170)
-            sc.grid(row=r, column=1, sticky="ew", pady=(4, 0))
-            self.crop_widgets += [lbl, sc]
-            r += 1
-        btn = ttk.Button(c, text="Centre crop", width=12, command=self.on_centre_crop)
-        btn.grid(row=r, column=1, sticky="w", pady=(2, 0))
+        rows = (("Crop X", self.var_crop_x, self.var_crop_x_label),
+                ("Crop Y", self.var_crop_y, self.var_crop_y_label))
+        for i, (label, var, textvar) in enumerate(rows):
+            lbl = ttk.Label(cropf, text=label, width=CROP_LABEL_WIDTH)
+            lbl.grid(row=i, column=0, sticky="w", padx=(0, 4), pady=(4, 0))
+
+            dec = ttk.Button(cropf, text="◀", width=2, takefocus=False)
+            dec.grid(row=i, column=1, pady=(4, 0))
+            self._bind_repeat(dec, lambda vr=var: self._nudge_crop(vr, -CROP_STEP))
+
+            sc = ttk.Scale(cropf, from_=-1.0, to=1.0, variable=var,
+                           orient="horizontal", length=CROP_SLIDER_LEN,
+                           command=lambda v, vr=var: self._snap_crop(vr, v))
+            sc.grid(row=i, column=2, sticky="ew", padx=(2, 2), pady=(4, 0))
+            # A short trough drags coarsely, so the keyboard and the wheel step
+            # by CROP_STEP to give fine control over the same range.
+            sc.bind("<Left>", lambda e, vr=var: self._nudge_crop(vr, -CROP_STEP))
+            sc.bind("<Right>", lambda e, vr=var: self._nudge_crop(vr, CROP_STEP))
+            sc.bind("<Up>", lambda e, vr=var: self._nudge_crop(vr, CROP_STEP))
+            sc.bind("<Down>", lambda e, vr=var: self._nudge_crop(vr, -CROP_STEP))
+            sc.bind("<MouseWheel>",
+                    lambda e, vr=var: self._nudge_crop(
+                        vr, CROP_STEP if e.delta > 0 else -CROP_STEP))
+            sc.bind("<Button-4>", lambda e, vr=var: self._nudge_crop(vr, CROP_STEP))
+            sc.bind("<Button-5>", lambda e, vr=var: self._nudge_crop(vr, -CROP_STEP))
+
+            inc = ttk.Button(cropf, text="▶", width=2, takefocus=False)
+            inc.grid(row=i, column=3, pady=(4, 0))
+            self._bind_repeat(inc, lambda vr=var: self._nudge_crop(vr, CROP_STEP))
+
+            ent = ttk.Entry(cropf, textvariable=textvar, width=6,
+                            justify="right")
+            ent.grid(row=i, column=4, sticky="w", padx=(6, 0), pady=(4, 0))
+            ent.bind("<Return>",
+                     lambda e, vr=var, tv=textvar: self._commit_crop_entry(vr, tv))
+            ent.bind("<KP_Enter>",
+                     lambda e, vr=var, tv=textvar: self._commit_crop_entry(vr, tv))
+            ent.bind("<FocusOut>",
+                     lambda e, vr=var, tv=textvar: self._commit_crop_entry(vr, tv))
+            ent.bind("<Escape>",
+                     lambda e, vr=var, tv=textvar: tv.set(format_crop(vr.get())))
+
+            self.crop_widgets += [lbl, dec, sc, inc, ent]
+        btn = ttk.Button(cropf, text="Centre crop", width=12,
+                         command=self.on_centre_crop)
+        btn.grid(row=len(rows), column=2, pady=(5, 0))  # no sticky -> centred
         self.crop_widgets.append(btn)
-        r += 1
+
+        hint = ttk.Label(c, text="0.00 = centred,  ±1.00 = against an edge",
+                         style="Hint.TLabel")
+        hint.grid(row=r, column=0, columnspan=2, sticky="w", padx=(10, 0),
+                  pady=(3, 0)); r += 1
+        self.crop_widgets.append(hint)
 
         ttk.Separator(c).grid(row=r, column=0, columnspan=2, sticky="ew", pady=7); r += 1
 
@@ -1040,23 +1206,26 @@ class App(tk.Tk):
                 .pack(side="left", padx=(0, 8))
         r += 1
 
-        ttk.Label(c, text="Quality (q:v)").grid(row=r, column=0, sticky="w",
-                                                padx=(10, 6), pady=(6, 0))
+        ttk.Label(c, text="Quality").grid(row=r, column=0, sticky="w",
+                                          padx=(10, 6), pady=(6, 0))
         qf = ttk.Frame(c)
         qf.grid(row=r, column=1, sticky="ew", pady=(6, 0))
         ttk.Scale(qf, from_=QUALITY_MIN, to=QUALITY_MAX, variable=self.var_quality,
                   orient="horizontal", length=140,
-                  command=lambda v: self.var_quality.set(int(float(v))))\
+                  command=lambda v: self.var_quality.set(int(round(float(v)))))\
             .pack(side="left")
-        ttk.Label(qf, textvariable=self.var_qualitylabel, width=3).pack(side="left", padx=(6, 0))
+        ttk.Label(qf, textvariable=self.var_qualitylabel, width=3, anchor="w")\
+            .pack(side="left", padx=(6, 0))
         r += 1
-        ttk.Label(c, text="lower = better quality, larger file", style="Hint.TLabel")\
+        ttk.Label(c, text="higher = better quality, larger file",
+                  style="Hint.TLabel")\
             .grid(row=r, column=0, columnspan=2, sticky="w", padx=(10, 0)); r += 1
 
         self.pad_row = ttk.Frame(c)
         self.pad_row.grid(row=r, column=0, columnspan=2, sticky="w",
                           padx=(10, 0), pady=(6, 0))
-        ttk.Label(self.pad_row, text="Pad colour").pack(side="left", padx=(0, 8))
+        self.lbl_pad = ttk.Label(self.pad_row, text="Pad colour")
+        self.lbl_pad.pack(side="left", padx=(0, 8))
         self.btn_pad = tk.Button(self.pad_row, width=4, relief="ridge",
                                  bg=self.params.pad_color, command=self.on_pick_pad_color)
         self.btn_pad.pack(side="left")
@@ -1065,7 +1234,7 @@ class App(tk.Tk):
         self.dur_row = ttk.Frame(c)
         self.dur_row.grid(row=r, column=0, columnspan=2, sticky="w",
                           padx=(10, 0), pady=(6, 0))
-        ttk.Label(self.dur_row, text="Still duration").pack(side="left", padx=(0, 8))
+        ttk.Label(self.dur_row, text="Video duration").pack(side="left", padx=(0, 8))
         ttk.Spinbox(self.dur_row, from_=0.1, to=3600, increment=0.5, width=7,
                     textvariable=self.var_duration).pack(side="left")
         ttk.Label(self.dur_row, text="s").pack(side="left", padx=(4, 0))
@@ -1077,14 +1246,13 @@ class App(tk.Tk):
 
         c.columnconfigure(1, weight=1)
 
-    def _build_bottom(self, root):
-        bottom = ttk.Frame(root)
-        bottom.grid(row=2, column=0, sticky="ew", pady=(10, 0))
-        bottom.columnconfigure(0, weight=1)
-
-        # timeline
-        self.timeline = ttk.Frame(bottom)
-        self.timeline.grid(row=0, column=0, sticky="ew")
+    def _build_timeline(self, parent):
+        """The scrubber sits under the two preview panes, not under the whole
+        window, so its right edge (and the time readout) lines up with the
+        right edge of the device preview."""
+        self.timeline = ttk.Frame(parent)
+        self.timeline.grid(row=1, column=0, columnspan=2, sticky="ew",
+                           padx=(0, 10), pady=(10, 0))
         self.timeline.columnconfigure(2, weight=1)
         ttk.Button(self.timeline, text="◀  −0.5 s", width=10,
                    command=lambda: self.on_step(-STEP_SECONDS))\
@@ -1096,12 +1264,19 @@ class App(tk.Tk):
                                     variable=self.var_time, orient="horizontal",
                                     command=self.on_time_scrub)
         self.scale_time.grid(row=0, column=2, sticky="ew")
-        ttk.Label(self.timeline, textvariable=self.var_timelabel, width=13,
-                  anchor="e").grid(row=0, column=3, padx=(10, 0))
+        self.lbl_time = ttk.Label(self.timeline, textvariable=self.var_timelabel,
+                                  width=TIME_LABEL_WIDTH, anchor="e")
+        self.lbl_time.grid(row=0, column=3, padx=(6, 0))
+
+    def _build_bottom(self, root):
+        bottom = ttk.Frame(root)
+        bottom.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        bottom.columnconfigure(0, weight=1)
 
         # command line
         cmdf = ttk.LabelFrame(bottom, text="ffmpeg command", padding=6)
-        cmdf.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        cmdf.grid(row=0, column=0, sticky="ew")
+        self.frame_cmd = cmdf
         cmdf.columnconfigure(0, weight=1)
         self.txt_cmd = tk.Text(cmdf, height=3, wrap="word", relief="flat",
                                bg="#f5f5f5", font=("TkFixedFont",))
@@ -1112,8 +1287,9 @@ class App(tk.Tk):
 
         # output + generate
         out = ttk.Frame(bottom)
-        out.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        out.grid(row=1, column=0, sticky="ew", pady=(10, 0))
         out.columnconfigure(1, weight=1)
+        self.frame_out = out
         ttk.Label(out, text="Output").grid(row=0, column=0, padx=(0, 8))
         ttk.Entry(out, textvariable=self.var_output).grid(row=0, column=1, sticky="ew")
         ttk.Button(out, text="Save as…", command=self.on_save_as)\
@@ -1123,7 +1299,7 @@ class App(tk.Tk):
         self.btn_generate.grid(row=0, column=3, padx=(12, 0))
 
         prog = ttk.Frame(bottom)
-        prog.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        prog.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         prog.columnconfigure(0, weight=1)
         self.progress = ttk.Progressbar(prog, mode="determinate", maximum=100.0)
         self.progress.grid(row=0, column=0, sticky="ew")
@@ -1144,14 +1320,18 @@ class App(tk.Tk):
     def _compose_device(self, frame):
         """Paste a 172x320 frame into the device photo and crop to the visible area.
 
-        The frame is masked with the panel's rounded corners so the preview
-        matches the hardware.  The encoded file itself stays a full rectangle.
+        The frame is turned by DEVICE_PANEL_ROTATION first, so the pane shows
+        what the panel will actually display rather than what is stored in the
+        file, and masked with the panel's rounded corners so the preview matches
+        the hardware.  The encoded file itself stays an unmasked full rectangle.
         """
         canvas = self.mockup.copy()
         x, y, w, h = MOCKUP_SCREEN
         if frame is None:
             screen = Image.new("RGB", (w, h), (8, 8, 8))
         else:
+            if DEVICE_PANEL_ROTATION == 180:
+                frame = frame.transpose(Image.ROTATE_180)
             screen = frame.resize((w, h), Image.LANCZOS)
         canvas.paste(screen, (x, y), self._screen_mask)
         return canvas.crop(MOCKUP_CROP)
@@ -1239,6 +1419,81 @@ class App(tk.Tk):
             pass
         return p
 
+    def _on_crop_change(self, *args):
+        try:
+            self.var_crop_x_label.set(format_crop(self.var_crop_x.get()))
+            self.var_crop_y_label.set(format_crop(self.var_crop_y.get()))
+        except tk.TclError:
+            pass
+        self._on_param_change(*args)
+
+    def _bind_repeat(self, button, callback):
+        """Fire callback on press, then keep firing while the button is held.
+
+        The buttons carry no -command: the press binding already fires once, so
+        adding one would double every click.
+        """
+        job = {"id": None}
+
+        def stop(_event=None):
+            if job["id"] is not None:
+                try:
+                    self.after_cancel(job["id"])
+                except Exception:
+                    pass
+                job["id"] = None
+
+        def tick(delay):
+            callback()
+            job["id"] = self.after(delay, lambda: tick(CROP_REPEAT_RATE_MS))
+
+        def start(_event=None):
+            if "disabled" in str(button.cget("state")):
+                return
+            stop()
+            tick(CROP_REPEAT_DELAY_MS)
+
+        button.bind("<ButtonPress-1>", start)
+        button.bind("<ButtonRelease-1>", stop)
+        button.bind("<Leave>", stop)
+
+    def _commit_crop_entry(self, var, textvar):
+        """Accept a typed crop offset, or put the old one back if it is junk."""
+        raw = textvar.get().strip().replace(",", ".").lstrip("+")
+        try:
+            v = float(raw)
+        except ValueError:
+            try:
+                v = var.get()
+            except tk.TclError:
+                v = 0.0
+        v = max(-1.0, min(1.0, round(round(v / CROP_STEP) * CROP_STEP, 3)))
+        var.set(v)
+        textvar.set(format_crop(v))
+
+    def _snap_crop(self, var, value):
+        """Quantise a dragged trough to CROP_STEP so the readout stays clean."""
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return
+        v = max(-1.0, min(1.0, round(round(v / CROP_STEP) * CROP_STEP, 3)))
+        try:
+            if abs(var.get() - v) > CROP_STEP / 100.0:
+                var.set(v)
+        except tk.TclError:
+            pass
+
+    def _nudge_crop(self, var, delta):
+        if self.var_fit.get() != "crop":
+            return "break"
+        try:
+            v = max(-1.0, min(1.0, round(var.get() + delta, 3)))
+        except tk.TclError:
+            return "break"
+        var.set(v)
+        return "break"
+
     def _on_quality_change(self, *_):
         try:
             self.var_qualitylabel.set(str(int(self.var_quality.get())))
@@ -1252,15 +1507,42 @@ class App(tk.Tk):
         self._update_enabled_state()
         self.schedule_preview()
 
+    def _set_tree_state(self, widget, enabled):
+        """Enable/disable every child of a container that understands -state.
+
+        Comboboxes go back to "readonly" rather than "normal", and the ffmpeg
+        command box stays read-only, so re-enabling never makes something
+        editable that was not editable before.
+        """
+        for child in widget.winfo_children():
+            if child is not self.txt_cmd:
+                if isinstance(child, ttk.Combobox):
+                    state = "readonly" if enabled else "disabled"
+                else:
+                    state = "normal" if enabled else "disabled"
+                try:
+                    child.configure(state=state)
+                except (tk.TclError, AttributeError):
+                    pass
+            self._set_tree_state(child, enabled)
+
     def _update_enabled_state(self):
-        crop_on = self.var_fit.get() == "crop"
+        # Nothing is adjustable until there is a file to adjust.
+        has_file = bool(self.info and self.info.ok)
+        for frame in (self.ctrl_frame, self.timeline, self.frame_cmd,
+                      self.frame_out):
+            self._set_tree_state(frame, has_file)
+
+        crop_on = has_file and self.var_fit.get() == "crop"
         for w in self.crop_widgets:
             try:
                 w.configure(state=("normal" if crop_on else "disabled"))
             except tk.TclError:
                 pass
-        pad_on = self.var_fit.get() == "fit"
-        self.btn_pad.configure(state=("normal" if pad_on else "disabled"))
+        pad_on = has_file and self.var_fit.get() == "fit"
+        pad_state = "normal" if pad_on else "disabled"
+        self.btn_pad.configure(state=pad_state)
+        self.lbl_pad.configure(state=pad_state)
 
         is_image = bool(self.info and self.info.is_image)
         if is_image:
@@ -1392,6 +1674,10 @@ class App(tk.Tk):
         self._suspend_traces = True
         self.var_time.set(0.0)
         self.scale_time.configure(to=max(0.001, info.duration))
+        # Only clips past the hour mark need room for the "h:" field; keeping
+        # the label narrow otherwise lets the trough run right up to it.
+        self.lbl_time.configure(
+            width=TIME_LABEL_WIDTH_H if info.duration >= 3600 else TIME_LABEL_WIDTH)
         self._suspend_traces = False
         self.var_timelabel.set(format_time(0.0))
 
