@@ -137,12 +137,30 @@ jobs:
             "out/NDXVO-ESP32-File-Converter-$V-macOS-arm64.dmg"
           ls -la out/
 
+      - name: Verify ffmpeg is inside the .app inside the .dmg
+        # Mounts the finished disk image and runs the ffmpeg that is actually
+        # shipped, so a build can never be published with ffmpeg missing.
+        run: |
+          V="${{ needs.preflight.outputs.version }}"
+          DMG="out/NDXVO-ESP32-File-Converter-$V-macOS-arm64.dmg"
+          MP="$(mktemp -d)"
+          hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MP"
+          FF="$MP/$APP_NAME.app/Contents/Frameworks/ffmpeg"
+          if [ ! -x "$FF" ]; then
+            echo "::error::ffmpeg is NOT inside the app bundle shipped in the .dmg"
+            find "$MP/$APP_NAME.app" -name 'ffmpeg*' -print || true
+            hdiutil detach "$MP" || true
+            exit 1
+          fi
+          echo "Bundled ffmpeg: $(stat -f%z "$FF") bytes"
+          "$FF" -version | head -1
+          echo "App bundle total: $(du -sh "$MP/$APP_NAME.app" | cut -f1)"
+          hdiutil detach "$MP"
+
       - uses: actions/upload-artifact@v7
         with:
           name: macos-arm64-dmg-${{ needs.preflight.outputs.version }}
           path: "out/*.dmg"
-          # exactly one file per build, so hand it over as-is instead of a zip
-          archive: false
 
   # -------------------------------------------------------------- Windows ---
   windows:
@@ -188,12 +206,22 @@ jobs:
              "out/NDXVO-ESP32-File-Converter-${{ needs.preflight.outputs.version }}-Windows-x64.exe"
           ls -la out/
 
+      - name: Verify ffmpeg is inside the .exe
+        # Reads the PyInstaller CArchive appended to the one-file executable and
+        # asserts ffmpeg.exe is one of its entries.
+        shell: bash
+        run: |
+          EXE="out/NDXVO-ESP32-File-Converter-${{ needs.preflight.outputs.version }}-Windows-x64.exe"
+          ls -l "$EXE"
+          python -m PyInstaller.utils.cliutils.archive_viewer --list --brief "$EXE" \
+            | tr ',' '\n' | grep -qi 'ffmpeg\.exe' \
+            || { echo "::error::ffmpeg.exe is NOT embedded in the one-file .exe"; exit 1; }
+          echo "ffmpeg.exe is embedded in the one-file executable."
+
       - uses: actions/upload-artifact@v7
         with:
           name: windows-x64-exe-${{ needs.preflight.outputs.version }}
           path: "out/*.exe"
-          # exactly one file per build, so hand it over as-is instead of a zip
-          archive: false
 
   # -------------------------------------------------------------- release ---
   # Runs only after BOTH builds succeed, so a tag is never created for a version
