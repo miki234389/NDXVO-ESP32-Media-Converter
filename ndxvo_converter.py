@@ -69,7 +69,7 @@ TIME_LABEL_WIDTH_H = 11  # ...widened to "h:mm:ss.mmm" for clips over an hour
 
 # Geometry of the embedded device photo (800x800 source), measured against a
 # reference shot of the panel showing a real UI.
-MOCKUP_SCREEN = (297, 227, 207, 385)   # x, y, w, h of the active LCD area
+MOCKUP_SCREEN = (294, 227, 207, 385)   # x, y, w, h of the active LCD area
 MOCKUP_CROP = (255, 165, 545, 635)     # visible region of the photo we display
 # The panel masks its corners; the radius is ~8.6% of the screen width.
 # This affects the preview only — the encoded video is always a full rectangle.
