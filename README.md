@@ -138,6 +138,28 @@ secrets — no restructuring required.
 
 ---
 
+## Claude in GitHub
+
+`.github/workflows/claude.yml` lets you mention `@claude` in an issue or pull
+request and have it do the work. It responds to a mention in an issue comment, a
+PR review comment, a PR review body, and in the title or body of a newly opened
+issue.
+
+It needs two things that are not in this repository:
+
+1. The [Claude GitHub App](https://github.com/apps/claude) installed here
+2. A repository secret with the credential — `CLAUDE_CODE_OAUTH_TOKEN` for a
+   Claude subscription (generate it with `claude setup-token`), or
+   `ANTHROPIC_API_KEY` for API billing
+
+Running `/install-github-app` inside Claude Code sets up both and opens a pull
+request with the workflow; the checked-in file is the manual equivalent.
+
+Only users with write access to the repository can trigger it, and bot accounts
+are rejected, so a bot cannot put Claude into a loop.
+
+---
+
 ## How the filter chain is built
 
 Order: `fps` → `scale` → `crop`/`pad` → rotation and mirroring.
