@@ -1,4 +1,4 @@
-# NDXVO ESP32 File Converter
+# NDXVO ESP32 Media Converter
 
 A single-file GUI that turns any video or still image into an MJPEG-AVI clip an
 ESP32 device with a 172 × 320 panel can play straight from an SD card.
