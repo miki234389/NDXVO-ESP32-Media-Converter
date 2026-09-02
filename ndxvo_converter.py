@@ -22,6 +22,7 @@ import io
 import os
 import queue
 import re
+import struct
 import shutil
 import subprocess
 import sys
@@ -59,6 +60,13 @@ APP_VERSION = "1.0.0-dev"
 
 OUT_W, OUT_H = 172, 320  # forced device resolution
 
+# The player allocates one frame buffer as
+#     estimateBufferSize = gfx->width() * gfx->height() * 2 / 5
+# and silently SKIPS any frame larger than that:
+#     if (video_bytes > estimateBufferSize) { ++avi_skipped_frames; return false; }
+# so a file whose frames overflow it plays as a black screen, not as a big file.
+FRAME_BUDGET_BYTES = OUT_W * OUT_H * 2 // 5
+
 CROP_LABEL_WIDTH = 7   # characters reserved for the "Crop X" / "Crop Y" labels
 CROP_SLIDER_LEN = 113  # px; two thirds of the original 170 px trough
 CROP_STEP = 0.01       # smallest crop offset step the arrows / keyboard produce
@@ -92,6 +100,25 @@ ROTATION_CHOICES = (0, 90, 180, 270)
 QUALITY_MIN, QUALITY_MAX = 1, 10
 QUALITY_QSCALE = (24, 16, 12, 9, 7, 5, 4, 3, 2, 1)
 QUALITY_DEFAULT = 9
+
+# Chroma subsampling.  The reference command used 4:2:0, but the panel is only
+# 172 px wide, so halving the colour resolution on top of that is the single
+# biggest quality loss in the chain.  JPEGDEC (the decoder the player uses)
+# handles 0x11 / 0x21 / 0x12 / 0x22, so all three are safe to decode; 4:2:2 is
+# the default because it keeps full horizontal colour at half the MCU count of
+# 4:4:4, and still fits the player's frame buffer at the best quality setting.
+CHROMA_CHOICES = (
+    ("yuvj420p", "4:2:0", "smallest, matches the original command"),
+    ("yuvj422p", "4:2:2", "full colour across, half the MCUs of 4:4:4"),
+    ("yuvj444p", "4:4:4", "full colour, largest frames - watch the budget"),
+)
+CHROMA_DEFAULT = "yuvj422p"
+
+# Unsharp amount for the mask applied after the downscale.  The radius is fixed
+# at 3x3: ffmpeg's 5x5 default is sized for 1080p and leaves visible halos on a
+# 172 px wide frame.  Chroma is left alone - sharpening it only adds bytes.
+SHARPEN_MAX = 1.5
+SHARPEN_RADIUS = 3
 
 PREVIEW_DEBOUNCE_MS = 150
 STEP_SECONDS = 0.5
@@ -573,6 +600,55 @@ def probe(path):
     return info
 
 
+def avi_frame_sizes(path):
+    """Sizes of every video chunk in an AVI, straight from the movi list.
+
+    Read from the container rather than from ffprobe so the check needs no
+    extra tool, and so it measures exactly what the player's AVI_frame_size()
+    will report.
+    """
+    sizes = []
+    try:
+        with open(path, "rb") as f:
+            if f.read(4) != b"RIFF":
+                return sizes
+            f.seek(4, 1)
+            if f.read(4) != b"AVI ":
+                return sizes
+            while True:
+                head = f.read(8)
+                if len(head) < 8:
+                    break
+                cid, size = head[:4], struct.unpack("<I", head[4:])[0]
+                if cid == b"LIST":
+                    if f.read(4) == b"movi":
+                        end = f.tell() + size - 4
+                        while f.tell() < end:
+                            ch = f.read(8)
+                            if len(ch) < 8:
+                                break
+                            ccid, csize = ch[:4], struct.unpack("<I", ch[4:])[0]
+                            if ccid[2:4] == b"dc":
+                                sizes.append(csize)
+                            f.seek(csize + (csize & 1), 1)
+                        return sizes
+                    f.seek(size - 4 + (size & 1), 1)
+                else:
+                    f.seek(size + (size & 1), 1)
+    except OSError:
+        pass
+    return sizes
+
+
+def frame_budget_report(path):
+    """(oversized, total, largest) against the player's per-frame buffer."""
+    sizes = avi_frame_sizes(path)
+    if not sizes:
+        return 0, 0, 0
+    over = sum(1 for v in sizes if v > FRAME_BUDGET_BYTES)
+    return over, len(sizes), max(sizes)
+
+
 def qscale_for(level):
     """Translate the 1..10 quality dial into an ffmpeg -q:v value."""
     try:
@@ -581,6 +657,14 @@ def qscale_for(level):
         level = QUALITY_DEFAULT
     level = max(QUALITY_MIN, min(QUALITY_MAX, level))
     return QUALITY_QSCALE[level - 1]
+
+
+def format_sharpen(value):
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "off"
+    return "off" if v < 0.005 else "%.1f" % v
 
 
 def format_crop(value):
@@ -613,6 +697,8 @@ class Params(object):
     def __init__(self):
         self.fps = 30
         self.quality = QUALITY_DEFAULT   # 1..10 dial, not ffmpeg's -q:v
+        self.chroma = CHROMA_DEFAULT     # ffmpeg -pix_fmt
+        self.sharpen = 0.0               # unsharp amount, 0 = off
         self.fit = "crop"          # crop | stretch | fit
         self.crop_x = 0.0          # -1 .. +1  (0 = centred)
         self.crop_y = 0.0
@@ -740,6 +826,13 @@ def build_vf(p, info, include_fps=True):
             y = max(0, min(sh - OUT_H, y))
             parts.append("crop=%d:%d:%d:%d" % (OUT_W, OUT_H, x, y))
 
+    if p.sharpen > 0.005:
+        # After the crop, so the mask works on output pixels rather than on the
+        # source, and its strength means the same thing whatever the input size.
+        parts.append("unsharp=%d:%d:%.2f:%d:%d:0"
+                     % (SHARPEN_RADIUS, SHARPEN_RADIUS, p.sharpen,
+                        SHARPEN_RADIUS, SHARPEN_RADIUS))
+
     if orientation_last:
         parts.extend(ops)
 
@@ -754,7 +847,7 @@ def build_generate_cmd(info, p, out_path):
                ["-i", info.path, "-t", "%.3f" % p.duration]
     else:
         cmd += ["-i", info.path]
-    cmd += ["-an", "-pix_fmt", "yuvj420p", "-c:v", "mjpeg",
+    cmd += ["-an", "-pix_fmt", p.chroma, "-c:v", "mjpeg",
             "-q:v", str(qscale_for(p.quality))]
     if vf:
         cmd += ["-vf", vf]
@@ -872,7 +965,9 @@ class Renderer(threading.Thread):
             cmd += ["-vf", vf]
         # Same codec and quality as the real export, so the preview shows the
         # actual MJPEG artefacts rather than a clean approximation.
-        cmd += ["-frames:v", "1", "-pix_fmt", "yuvj420p",
+        # Same codec, quality AND chroma as the export, so the pane shows the
+        # real colour resolution and not a cleaner 4:4:4 stand-in.
+        cmd += ["-frames:v", "1", "-pix_fmt", p.chroma,
                 "-c:v", "mjpeg", "-q:v", str(qscale_for(p.quality)),
                 "-f", "image2pipe", "-"]
         rc, out, err = run_capture(cmd)
@@ -1000,6 +1095,8 @@ class App(tk.Tk):
         p = self.params
         self.var_fps = tk.IntVar(value=p.fps)
         self.var_quality = tk.IntVar(value=p.quality)
+        self.var_chroma = tk.StringVar(value=p.chroma)
+        self.var_sharpen = tk.DoubleVar(value=p.sharpen)
         self.var_fit = tk.StringVar(value=p.fit)
         self.var_crop_x = tk.DoubleVar(value=p.crop_x)
         self.var_crop_y = tk.DoubleVar(value=p.crop_y)
@@ -1017,11 +1114,13 @@ class App(tk.Tk):
         self.var_crop_x_label = tk.StringVar(value=format_crop(p.crop_x))
         self.var_crop_y_label = tk.StringVar(value=format_crop(p.crop_y))
         self.var_qualitylabel = tk.StringVar(value=str(p.quality))
+        self.var_sharpenlabel = tk.StringVar(value=format_sharpen(p.sharpen))
 
-        for v in (self.var_fps, self.var_fit, self.var_rotation,
+        for v in (self.var_fps, self.var_chroma, self.var_fit, self.var_rotation,
                   self.var_mirror_h, self.var_mirror_v, self.var_duration):
             v.trace_add("write", self._on_param_change)
         self.var_quality.trace_add("write", self._on_quality_change)
+        self.var_sharpen.trace_add("write", self._on_sharpen_change)
         self.var_crop_x.trace_add("write", self._on_crop_change)
         self.var_crop_y.trace_add("write", self._on_crop_change)
 
@@ -1217,7 +1316,33 @@ class App(tk.Tk):
         ttk.Label(qf, textvariable=self.var_qualitylabel, width=3, anchor="w")\
             .pack(side="left", padx=(6, 0))
         r += 1
-        ttk.Label(c, text="higher = better quality, larger file",
+        ttk.Label(c, text="higher = better, bigger, slower to decode",
+                  style="Hint.TLabel")\
+            .grid(row=r, column=0, columnspan=2, sticky="w", padx=(10, 0)); r += 1
+
+        chf = ttk.Frame(c)
+        chf.grid(row=r, column=0, columnspan=2, sticky="w", padx=(10, 0),
+                 pady=(6, 0))
+        ttk.Label(chf, text="Colour").pack(side="left", padx=(0, 8))
+        for value, label, _why in CHROMA_CHOICES:
+            ttk.Radiobutton(chf, text=label, value=value,
+                            variable=self.var_chroma).pack(side="left", padx=(0, 8))
+        r += 1
+        ttk.Label(c, text="4:2:2 photo & video  ·  4:4:4 graphics & text",
+                  style="Hint.TLabel")\
+            .grid(row=r, column=0, columnspan=2, sticky="w", padx=(10, 0)); r += 1
+
+        ttk.Label(c, text="Sharpen").grid(row=r, column=0, sticky="w",
+                                          padx=(10, 6), pady=(6, 0))
+        shf = ttk.Frame(c)
+        shf.grid(row=r, column=1, sticky="ew", pady=(6, 0))
+        ttk.Scale(shf, from_=0.0, to=SHARPEN_MAX, variable=self.var_sharpen,
+                  orient="horizontal", length=140,
+                  command=self._snap_sharpen).pack(side="left")
+        ttk.Label(shf, textvariable=self.var_sharpenlabel, width=3,
+                  anchor="w").pack(side="left", padx=(6, 0))
+        r += 1
+        ttk.Label(c, text="counters the downscale  ·  adds bytes",
                   style="Hint.TLabel")\
             .grid(row=r, column=0, columnspan=2, sticky="w", padx=(10, 0)); r += 1
 
@@ -1408,6 +1533,10 @@ class App(tk.Tk):
         try:
             p.fps = int(self.var_fps.get())
             p.quality = max(QUALITY_MIN, min(QUALITY_MAX, int(self.var_quality.get())))
+            chroma = self.var_chroma.get()
+            p.chroma = chroma if chroma in [c[0] for c in CHROMA_CHOICES] \
+                else CHROMA_DEFAULT
+            p.sharpen = max(0.0, min(SHARPEN_MAX, float(self.var_sharpen.get())))
             p.fit = self.var_fit.get()
             p.crop_x = max(-1.0, min(1.0, float(self.var_crop_x.get())))
             p.crop_y = max(-1.0, min(1.0, float(self.var_crop_y.get())))
@@ -1493,6 +1622,24 @@ class App(tk.Tk):
             return "break"
         var.set(v)
         return "break"
+
+    def _snap_sharpen(self, value):
+        try:
+            v = max(0.0, min(SHARPEN_MAX, round(float(value), 1)))
+        except (TypeError, ValueError):
+            return
+        try:
+            if abs(self.var_sharpen.get() - v) > 1e-9:
+                self.var_sharpen.set(v)
+        except tk.TclError:
+            pass
+
+    def _on_sharpen_change(self, *_):
+        try:
+            self.var_sharpenlabel.set(format_sharpen(self.var_sharpen.get()))
+        except tk.TclError:
+            pass
+        self._on_param_change()
 
     def _on_quality_change(self, *_):
         try:
@@ -1621,7 +1768,23 @@ class App(tk.Tk):
                 self.progress["value"] = 100
                 out = self.var_output.get()
                 self.var_status.set("Done → " + os.path.basename(out))
-                messagebox.showinfo(APP_TITLE, "Finished.\n\n%s" % out)
+                over, total, largest = frame_budget_report(out)
+                if over:
+                    messagebox.showwarning(
+                        APP_TITLE,
+                        "Finished, but %d of %d frames are too big for the "
+                        "player.\n\n%s\n\nThe player skips any frame over "
+                        "%d bytes (width x height x 2 / 5); the largest here is "
+                        "%d. Those frames will not be shown on the device.\n\n"
+                        "Lower Quality, or pick a coarser Colour setting, and "
+                        "generate again."
+                        % (over, total, out, FRAME_BUDGET_BYTES, largest))
+                else:
+                    extra = ""
+                    if total:
+                        extra = ("\n\nLargest frame %d bytes of the %d the "
+                                 "player allows." % (largest, FRAME_BUDGET_BYTES))
+                    messagebox.showinfo(APP_TITLE, "Finished.\n\n%s%s" % (out, extra))
             else:
                 self.progress["value"] = 0
                 if msg == "cancelled":
@@ -1742,6 +1905,8 @@ class App(tk.Tk):
         self._suspend_traces = True
         self.var_fps.set(defaults.fps)
         self.var_quality.set(defaults.quality)
+        self.var_chroma.set(defaults.chroma)
+        self.var_sharpen.set(defaults.sharpen)
         self.var_fit.set(defaults.fit)
         self.var_crop_x.set(defaults.crop_x)
         self.var_crop_y.set(defaults.crop_y)
@@ -1752,6 +1917,7 @@ class App(tk.Tk):
         self.var_duration.set(defaults.duration)
         self._suspend_traces = False
         self.var_qualitylabel.set(str(defaults.quality))
+        self.var_sharpenlabel.set(format_sharpen(defaults.sharpen))
         self._on_param_change()
 
     def on_copy_cmd(self):
