@@ -1,7 +1,8 @@
 # NDXVO Media Converter
 
-A single-file GUI that turns any video or still image into an MJPEG-AVI clip an
-ESP32 device with a 172 × 320 panel can play straight from an SD card.
+A single-file GUI that turns any video or still image into an MJPEG-AVI clip, or
+a single JPEG, that an ESP32 device with a 172 × 320 panel shows straight from
+an SD card.
 
 It is a graphical superset of this command:
 
@@ -14,6 +15,15 @@ ffmpeg -y -i input5.mp4 -an -pix_fmt yuvj420p -c:v mjpeg -q:v 2 \
 With the default settings the app emits a **byte-for-byte identical file** to
 that command (verified against the same ffmpeg build — different ffmpeg versions
 encode slightly differently, which is expected).
+
+Saved as **Image (.jpg)**, the same chain runs on one frame. For a 4032 × 3024
+photo with the default settings:
+
+```
+ffmpeg -y -noautorotate -i photo.jpg -frames:v 1 -pix_fmt yuvj420p -c:v mjpeg -q:v 2 \
+  -vf "scale=426:320:flags=lanczos,crop=172:320:127:0,hflip,vflip" \
+  -f image2 -update 1 photo_esp32.jpg
+```
 
 ---
 
@@ -29,14 +39,25 @@ encode slightly differently, which is expected).
 - Fit modes: **Crop** (fill and trim, with X/Y framing sliders), **Stretch**,
   **Fit** (letterbox with a configurable pad colour).
 - Rotation in 90° steps plus independent horizontal / vertical mirroring.
-- Still images become clips of a configurable length.
+- **Format**: *Video (.avi)* or *Image (.jpg)*. A photo starts as a JPEG the
+  device shows directly, or becomes a clip of a configurable length; a video
+  starts as a clip, or saves the frame under the scrubber as a JPEG. The choice
+  is remembered separately for photos and videos while the app is open.
 - The exact ffmpeg command is always shown and can be copied.
-- Output resolution is locked to 172 × 320 MJPEG/AVI, so you cannot accidentally
-  produce a file the device will not play. FPS (30 / 25) and JPEG quality remain
-  adjustable.
-- Every export is read back before it is reported as done: it must be MJPEG,
-  tagged `MJPG`, 172 × 320, at the chosen FPS. If it is not, the app says exactly
-  what is wrong and saves `<name>_report.txt` next to the video — app version,
+- Output resolution is locked to 172 × 320, as MJPEG/AVI or baseline JPEG, so you
+  cannot accidentally produce a file the device will not show. FPS (30 / 25, AVI
+  only) and JPEG quality remain adjustable.
+- Colour is fixed at 4:2:0 (`yuvj420p`). The device's decoder (JPEGDEC) reads
+  the MCU layout from the luma channel alone and assumes the colour channels are
+  1×1; ffmpeg writes 4:2:2 as Y 2×2 / Cb,Cr 1×2 and 4:4:4 as 1×2 throughout, so
+  both fail to decode ("Invalid image file") in AVIs and JPEGs alike.
+- Every export is read back before it is reported as done: an AVI must be MJPEG,
+  tagged `MJPG`, 172 × 320, at the chosen FPS; a JPEG must be 172 × 320. Both
+  must be baseline (the device cannot decode progressive) with the 4:2:0
+  layout above (an AVI is checked on its first frame). The per-frame size limit is
+  checked for AVIs only: the device decodes a JPEG straight from the card, so a
+  large one just takes longer to draw. If a check fails, the app says exactly
+  what is wrong and saves `<name>_report.txt` next to the file — app version,
   system, ffmpeg path and version, the exact command, and the full ffmpeg log —
   so a bad file can be diagnosed without anyone touching a terminal.
 - The ffmpeg in use is always shown in its own row, with full path and version,

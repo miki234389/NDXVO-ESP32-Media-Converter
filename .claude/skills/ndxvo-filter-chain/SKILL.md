@@ -50,9 +50,14 @@ Code lives in the "Filter chain" section of `ndxvo_converter.py`. Pull it with:
   works on the displayed size.
 - **Stills** use `-loop 1 -framerate <fps> -noautorotate -i img -t <duration>`,
   with no `fps` filter.
+- **JPEG output** (`p.out_format == "jpg"`): `[-ss <at> for videos] [-noautorotate for stills]
+  -i src -frames:v 1 ... -vf <chain without fps> -f image2 -update 1 out.jpg`.
+  This is the preview's own command, so the file is byte-identical to the
+  frame in the device pane (verified on ffmpeg 7.1.1 for stills and videos).
 - **Quality dial**: levels 1..10 map through
   `QUALITY_QSCALE = (24,16,12,9,7,5,4,3,2,1)`; level 9 is `-q:v 2`, as in the
-  reference. Chroma is passed as `-pix_fmt` (`yuvj420p` / `yuvj422p` / `yuvj444p`).
+  reference. Chroma is fixed: `-pix_fmt yuvj420p` (`PIX_FMT`), because the
+  device's JPEGDEC cannot decode ffmpeg's 4:2:2 / 4:4:4 layouts (see ndxvo-frame-budget).
 - **Preview vs export**: `_extract_processed` calls `build_vf(..., include_fps=False)`
   and must pass the same `-pix_fmt`, `-c:v mjpeg` and `-q:v` as `build_generate_cmd`.
   When you change one, change the other.
@@ -65,7 +70,7 @@ On Windows and macOS (tkinter present), run this from the repo root:
 import ndxvo_converter as n
 info = n.MediaInfo("in.mp4"); info.ok = True
 info.width, info.height, info.duration, info.fps = 1920, 1080, 10.0, 30.0
-p = n.Params()              # edit: p.rotation, p.fit, p.crop_x, p.mirror_h, p.chroma, p.quality, p.sharpen ...
+p = n.Params()              # edit: p.rotation, p.fit, p.crop_x, p.mirror_h, p.quality, p.sharpen, p.out_format ...
 print(n.build_vf(p, info))
 print(n.quote_cmd(n.build_generate_cmd(info, p, "out.avi")))
 ```
@@ -94,7 +99,7 @@ The known-good baseline is a 1920x1080 video with defaults, which gives
   Keep `format=rgb24`. Without it the lavfi source rounds odd sizes down, which hides odd-size bugs.
 - **Byte identity with the reference**:
   1. Make a source: `ffmpeg -f lavfi -i testsrc2=s=1920x1080:r=30:d=2 -c:v ffv1 src.mkv`.
-  2. Run the reference command and the app's command with `p.chroma = "yuvj420p"`, quality 9 and other defaults.
+  2. Run the reference command and the app's command with default `Params()`.
   3. Compare hashes (`certutil -hashfile a.avi SHA256` on Windows, `shasum -a 256` on macOS).
 
   Different ffmpeg versions encode differently, so compare outputs from one binary only.
@@ -113,8 +118,8 @@ The known-good baseline is a 1920x1080 video with defaults, which gives
   Common sources (1920x1080, 1280x720, 1080x1920, 3840x2160) are unaffected,
   and the output stays a valid 172x320. A fix that matches ffmpeg is
   `int(math.floor(value / 2.0 + 0.5)) * 2`.
-- **Defaults no longer match the reference**: they now use 4:2:2 chroma
-  (`CHROMA_DEFAULT = "yuvj422p"`). Byte identity needs Colour set to 4:2:0.
+- **Defaults match the reference byte for byte** again since chroma was fixed at
+  4:2:0 (verified 2026-10-11 on ffmpeg 7.1.1 with the ffv1 source above).
 
 ## Change checklist
 

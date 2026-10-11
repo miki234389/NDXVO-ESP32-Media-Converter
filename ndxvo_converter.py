@@ -4,8 +4,9 @@
 NDXVO Media Converter
 =====================
 
-Single-file GUI for converting videos / stills into MJPEG-AVI clips that an
-ESP32 device with a 172x320 panel can play straight from an SD card.
+Single-file GUI for converting videos / stills into MJPEG-AVI clips, or into
+single baseline JPEGs, that an ESP32 device with a 172x320 panel shows straight
+from an SD card.
 
 Reference command this tool generalises:
 
@@ -94,6 +95,14 @@ DEVICE_PANEL_ROTATION = 180
 
 FPS_CHOICES = (30, 25)
 ROTATION_CHOICES = (0, 90, 180, 270)
+
+# The device shows two kinds of file: an MJPEG AVI clip, or a single baseline
+# JPEG (from a photo, or the frame under the scrubber of a video).  A newly
+# opened file starts with the format for its kind; switching is remembered per
+# kind for the rest of the session.
+OUT_FORMATS = (("avi", "Video (.avi)"), ("jpg", "Image (.jpg)"))
+FORMAT_DEFAULT_IMAGE = "jpg"
+FORMAT_DEFAULT_VIDEO = "avi"
 # Quality is shown to the user as a plain 1..10 dial, highest = best, because
 # ffmpeg's -q:v runs the other way (2 = near-lossless, 31 = coarse) and that
 # inversion is a constant source of confusion.  The table below is the whole
@@ -103,18 +112,14 @@ QUALITY_MIN, QUALITY_MAX = 1, 10
 QUALITY_QSCALE = (24, 16, 12, 9, 7, 5, 4, 3, 2, 1)
 QUALITY_DEFAULT = 9
 
-# Chroma subsampling.  The reference command used 4:2:0, but the panel is only
-# 172 px wide, so halving the colour resolution on top of that is the single
-# biggest quality loss in the chain.  JPEGDEC (the decoder the player uses)
-# handles 0x11 / 0x21 / 0x12 / 0x22, so all three are safe to decode; 4:2:2 is
-# the default because it keeps full horizontal colour at half the MCU count of
-# 4:4:4, and still fits the player's frame buffer at the best quality setting.
-CHROMA_CHOICES = (
-    ("yuvj420p", "4:2:0", "smallest, matches the original command"),
-    ("yuvj422p", "4:2:2", "full colour across, half the MCUs of 4:4:4"),
-    ("yuvj444p", "4:4:4", "full colour, largest frames - watch the budget"),
-)
-CHROMA_DEFAULT = "yuvj422p"
+# Chroma subsampling is fixed at 4:2:0.  JPEGDEC, the decoder the device uses
+# for AVI frames and JPEG images alike, picks its MCU layout from the luma
+# sampling factors alone and assumes Cb and Cr are always 1x1.  ffmpeg's mjpeg
+# encoder always gives luma two block rows per MCU, so its 4:2:2 comes out as
+# Y 2x2 / Cb 1x2 / Cr 1x2 and its 4:4:4 as 1x2 / 1x2 / 1x2: JPEGDEC misreads
+# both and stops with JPEG_DECODE_ERROR ("Invalid image file").  4:2:0 is
+# 2x2 / 1x1 / 1x1, the only layout ffmpeg writes that the device decodes.
+PIX_FMT = "yuvj420p"
 
 # Unsharp amount for the mask applied after the downscale.  The radius is fixed
 # at 3x3: ffmpeg's 5x5 default is sized for 1080p and leaves visible halos on a
@@ -709,6 +714,36 @@ def probe(path):
     return info
 
 
+def _avi_video_chunks(f):
+    """(offset, size) of every video chunk in the movi list of an open AVI."""
+    if f.read(4) != b"RIFF":
+        return
+    f.seek(4, 1)
+    if f.read(4) != b"AVI ":
+        return
+    while True:
+        head = f.read(8)
+        if len(head) < 8:
+            return
+        cid, size = head[:4], struct.unpack("<I", head[4:])[0]
+        if cid == b"LIST":
+            if f.read(4) == b"movi":
+                end = f.tell() + size - 4
+                while f.tell() < end:
+                    ch = f.read(8)
+                    if len(ch) < 8:
+                        return
+                    ccid, csize = ch[:4], struct.unpack("<I", ch[4:])[0]
+                    pos = f.tell()
+                    if ccid[2:4] == b"dc":
+                        yield pos, csize
+                    f.seek(pos + csize + (csize & 1))
+                return
+            f.seek(size - 4 + (size & 1), 1)
+        else:
+            f.seek(size + (size & 1), 1)
+
+
 def avi_frame_sizes(path):
     """Sizes of every video chunk in an AVI, straight from the movi list.
 
@@ -719,34 +754,23 @@ def avi_frame_sizes(path):
     sizes = []
     try:
         with open(path, "rb") as f:
-            if f.read(4) != b"RIFF":
-                return sizes
-            f.seek(4, 1)
-            if f.read(4) != b"AVI ":
-                return sizes
-            while True:
-                head = f.read(8)
-                if len(head) < 8:
-                    break
-                cid, size = head[:4], struct.unpack("<I", head[4:])[0]
-                if cid == b"LIST":
-                    if f.read(4) == b"movi":
-                        end = f.tell() + size - 4
-                        while f.tell() < end:
-                            ch = f.read(8)
-                            if len(ch) < 8:
-                                break
-                            ccid, csize = ch[:4], struct.unpack("<I", ch[4:])[0]
-                            if ccid[2:4] == b"dc":
-                                sizes.append(csize)
-                            f.seek(csize + (csize & 1), 1)
-                        return sizes
-                    f.seek(size - 4 + (size & 1), 1)
-                else:
-                    f.seek(size + (size & 1), 1)
+            for _pos, size in _avi_video_chunks(f):
+                sizes.append(size)
     except OSError:
         pass
     return sizes
+
+
+def avi_first_frame(path):
+    """The JPEG bitstream of an AVI's first video frame, or b"" if there is none."""
+    try:
+        with open(path, "rb") as f:
+            for pos, size in _avi_video_chunks(f):
+                f.seek(pos)
+                return f.read(size)
+    except OSError:
+        pass
+    return b""
 
 
 def frame_budget_report(path):
@@ -776,11 +800,60 @@ def avi_video_fourcc(path):
     return ""
 
 
+def jpeg_frame_header(data):
+    """(SOF marker, per-component sampling bytes) of a JPEG, or None.
+
+    Each sampling byte is H << 4 | V, so 0x22 is 2x2.  SOF0 (0xC0) is baseline,
+    0xC2 progressive.
+    """
+    if data[:2] != b"\xff\xd8":
+        return None
+    i = 2
+    while i + 4 <= len(data) and data[i] == 0xFF:
+        marker = data[i + 1]
+        if marker == 0xFF:            # fill byte before a marker
+            i += 1
+            continue
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            if i + 10 > len(data):
+                return None
+            count = data[i + 9]
+            sampling = tuple(data[i + 11 + 3 * c] for c in range(count)
+                             if i + 11 + 3 * c < len(data))
+            return marker, sampling
+        i += 2 + struct.unpack(">H", data[i + 2:i + 4])[0]
+    return None
+
+
+def jpeg_decoder_problems(data):
+    """What stops JPEGDEC on the device from decoding this JPEG bitstream."""
+    head = jpeg_frame_header(data)
+    if head is None:
+        return ["no JPEG frame header found"]
+    marker, sampling = head
+    problems = []
+    if marker == 0xC2:
+        problems.append("the JPEG is progressive, the device needs baseline")
+    elif marker != 0xC0:
+        problems.append("the JPEG is not baseline (SOF%d), the device needs "
+                        "baseline" % (marker - 0xC0))
+    # JPEGDEC takes the MCU layout from Y alone and assumes Cb and Cr are 1x1
+    # (see PIX_FMT).
+    if len(sampling) == 3 and (sampling[0] not in (0x11, 0x12, 0x21, 0x22)
+                               or sampling[1:] != (0x11, 0x11)):
+        problems.append("colour sampling is Y %s / Cb %s / Cr %s, the device "
+                        "needs Cb and Cr at 1x1 (4:2:0)"
+                        % tuple("%dx%d" % (s >> 4, s & 15) for s in sampling))
+    return problems
+
+
 def verify_output(path, p):
     """Read a finished file back and list what makes it unusable on the device.
 
     An empty list means MJPEG, tagged MJPG, 172 x 320, at the chosen frame
-    rate.  It inspects the file itself, not the command that produced it.
+    rate - or, for a JPEG, MJPEG at 172 x 320 - and in both cases a baseline
+    bitstream with a colour layout JPEGDEC decodes.  It inspects the file
+    itself, not the command that produced it.
     """
     if not os.path.isfile(path):
         return ["the output file was not created"]
@@ -789,20 +862,33 @@ def verify_output(path, p):
     got = probe(path)
     if not got.ok:
         return ["the output file cannot be read back (%s)" % got.error]
+    as_jpg = p.out_format == "jpg"
     problems = []
     if got.codec != "mjpeg":
         problems.append("video codec is %s, the device needs mjpeg"
                         % (got.codec or "unknown"))
-    fourcc = avi_video_fourcc(path)
-    if fourcc.upper() != "MJPG":
-        problems.append("AVI video tag is %s, the device needs MJPG"
-                        % (repr(fourcc) if fourcc else "missing"))
+    if not as_jpg:
+        fourcc = avi_video_fourcc(path)
+        if fourcc.upper() != "MJPG":
+            problems.append("AVI video tag is %s, the device needs MJPG"
+                            % (repr(fourcc) if fourcc else "missing"))
     if (got.width, got.height) != (OUT_W, OUT_H):
         problems.append("resolution is %d x %d, the device needs %d x %d"
                         % (got.width, got.height, OUT_W, OUT_H))
-    if got.fps and abs(got.fps - p.fps) > 0.01:
+    if not as_jpg and got.fps and abs(got.fps - p.fps) > 0.01:
         problems.append("frame rate is %.3f fps, %d fps was chosen"
                         % (got.fps, p.fps))
+    # The decoder sees the JPEG bitstream: the file itself, or an AVI frame
+    # (one encoder run writes them all alike, so the first stands for all).
+    if as_jpg:
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            data = b""
+    else:
+        data = avi_first_frame(path)
+    problems += jpeg_decoder_problems(data)
     return problems
 
 
@@ -854,7 +940,6 @@ class Params(object):
     def __init__(self):
         self.fps = 30
         self.quality = QUALITY_DEFAULT   # 1..10 dial, not ffmpeg's -q:v
-        self.chroma = CHROMA_DEFAULT     # ffmpeg -pix_fmt
         self.sharpen = 0.0               # unsharp amount, 0 = off
         self.fit = "crop"          # crop | stretch | fit
         self.crop_x = 0.0          # -1 .. +1  (0 = centred)
@@ -864,6 +949,7 @@ class Params(object):
         self.mirror_v = False
         self.pad_color = "#000000"
         self.duration = 5.0        # still-image clip length, seconds
+        self.out_format = "avi"    # avi clip | jpg single frame
 
     def copy(self):
         p = Params()
@@ -996,20 +1082,43 @@ def build_vf(p, info, include_fps=True):
     return ",".join(parts)
 
 
-def build_generate_cmd(info, p, out_path):
-    vf = build_vf(p, info, include_fps=not info.is_image)
+def build_generate_cmd(info, p, out_path, at=0.0):
+    """The export command.  `at` is where in a video a JPEG frame is taken."""
     cmd = [FFMPEG or "ffmpeg", "-y"]
-    if info.is_image:
-        cmd += ["-loop", "1", "-framerate", str(p.fps)] + input_args(info) + \
-               ["-i", info.path, "-t", "%.3f" % p.duration]
+    tail = []
+    if p.out_format == "jpg":
+        # One frame, sought and encoded exactly as the preview pane does it, so
+        # the file is byte-for-byte the frame shown.  -update 1 writes a single
+        # image under that literal name (no %d sequence pattern).
+        if not info.is_image:
+            cmd += ["-ss", "%.3f" % at]
+        cmd += input_args(info) + ["-i", info.path, "-frames:v", "1"]
+        tail = ["-f", "image2", "-update", "1"]
+        vf = build_vf(p, info, include_fps=False)
     else:
-        cmd += ["-i", info.path]
-    cmd += ["-an", "-pix_fmt", p.chroma, "-c:v", "mjpeg",
+        if info.is_image:
+            cmd += ["-loop", "1", "-framerate", str(p.fps)] + input_args(info) + \
+                   ["-i", info.path, "-t", "%.3f" % p.duration]
+        else:
+            cmd += ["-i", info.path]
+        cmd += ["-an"]
+        vf = build_vf(p, info, include_fps=not info.is_image)
+    cmd += ["-pix_fmt", PIX_FMT, "-c:v", "mjpeg",
             "-q:v", str(qscale_for(p.quality))]
     if vf:
         cmd += ["-vf", vf]
-    cmd += [out_path]
+    cmd += tail + [out_path]
     return cmd
+
+
+def output_path(base, source, fmt):
+    """`base` with the extension for `fmt`, never naming the source file itself."""
+    out = base + "." + fmt
+    # Windows and macOS ignore case in file names, so photo.JPG and photo.jpg
+    # are one file there: compare the same way rather than overwrite the source.
+    if os.path.abspath(out).lower() == os.path.abspath(source).lower():
+        out = base + "_esp32." + fmt
+    return out
 
 
 def quote_cmd(cmd):
@@ -1120,11 +1229,9 @@ class Renderer(threading.Thread):
         cmd += input_args(job.info) + ["-i", job.info.path]
         if vf:
             cmd += ["-vf", vf]
-        # Same codec and quality as the real export, so the preview shows the
-        # actual MJPEG artefacts rather than a clean approximation.
-        # Same codec, quality AND chroma as the export, so the pane shows the
-        # real colour resolution and not a cleaner 4:4:4 stand-in.
-        cmd += ["-frames:v", "1", "-pix_fmt", p.chroma,
+        # Same codec, quality and chroma as the real export, so the preview
+        # shows the actual MJPEG artefacts rather than a clean approximation.
+        cmd += ["-frames:v", "1", "-pix_fmt", PIX_FMT,
                 "-c:v", "mjpeg", "-q:v", str(qscale_for(p.quality)),
                 "-f", "image2pipe", "-"]
         rc, out, err = run_capture(cmd)
@@ -1226,6 +1333,8 @@ class App(tk.Tk):
         self.info = None
         self.params = Params()
         self.timestamp = 0.0
+        # Output format last chosen for photos (True) and for videos (False).
+        self._format_by_kind = {True: FORMAT_DEFAULT_IMAGE, False: FORMAT_DEFAULT_VIDEO}
         self._seq = 0
         self._debounce_id = None
         self._suspend_traces = False
@@ -1268,7 +1377,6 @@ class App(tk.Tk):
         p = self.params
         self.var_fps = tk.IntVar(value=p.fps)
         self.var_quality = tk.IntVar(value=p.quality)
-        self.var_chroma = tk.StringVar(value=p.chroma)
         self.var_sharpen = tk.DoubleVar(value=p.sharpen)
         self.var_fit = tk.StringVar(value=p.fit)
         self.var_crop_x = tk.DoubleVar(value=p.crop_x)
@@ -1277,6 +1385,8 @@ class App(tk.Tk):
         self.var_mirror_h = tk.BooleanVar(value=p.mirror_h)
         self.var_mirror_v = tk.BooleanVar(value=p.mirror_v)
         self.var_duration = tk.DoubleVar(value=p.duration)
+        self.var_format = tk.StringVar(value=p.out_format)
+        self.var_format_hint = tk.StringVar(value="")
         self.var_time = tk.DoubleVar(value=0.0)
 
         self.var_source = tk.StringVar(value="No file selected")
@@ -1291,9 +1401,10 @@ class App(tk.Tk):
         self.var_qualitylabel = tk.StringVar(value=str(p.quality))
         self.var_sharpenlabel = tk.StringVar(value=format_sharpen(p.sharpen))
 
-        for v in (self.var_fps, self.var_chroma, self.var_fit, self.var_rotation,
+        for v in (self.var_fps, self.var_fit, self.var_rotation,
                   self.var_mirror_h, self.var_mirror_v, self.var_duration):
             v.trace_add("write", self._on_param_change)
+        self.var_format.trace_add("write", self._on_format_change)
         self.var_quality.trace_add("write", self._on_quality_change)
         self.var_sharpen.trace_add("write", self._on_sharpen_change)
         self.var_crop_x.trace_add("write", self._on_crop_change)
@@ -1469,15 +1580,22 @@ class App(tk.Tk):
 
         ttk.Label(c, text="Output", style="Head.TLabel")\
             .grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
-        ttk.Label(c, text="Resolution 172 × 320 (fixed)   ·   MJPEG / AVI",
-                  style="Hint.TLabel")\
+        fmtf = ttk.Frame(c)
+        fmtf.grid(row=r, column=0, columnspan=2, sticky="w", padx=(10, 0))
+        ttk.Label(fmtf, text="Format").pack(side="left", padx=(0, 8))
+        for value, label in OUT_FORMATS:
+            ttk.Radiobutton(fmtf, text=label, value=value, variable=self.var_format)\
+                .pack(side="left", padx=(0, 8))
+        r += 1
+        ttk.Label(c, textvariable=self.var_format_hint, style="Hint.TLabel")\
             .grid(row=r, column=0, columnspan=2, sticky="w", padx=(10, 0)); r += 1
 
-        fpsf = ttk.Frame(c)
-        fpsf.grid(row=r, column=0, columnspan=2, sticky="w", padx=(10, 0), pady=(6, 0))
-        ttk.Label(fpsf, text="FPS").pack(side="left", padx=(0, 8))
+        self.fps_row = ttk.Frame(c)
+        self.fps_row.grid(row=r, column=0, columnspan=2, sticky="w", padx=(10, 0),
+                          pady=(6, 0))
+        ttk.Label(self.fps_row, text="FPS").pack(side="left", padx=(0, 8))
         for f in FPS_CHOICES:
-            ttk.Radiobutton(fpsf, text=str(f), value=f, variable=self.var_fps)\
+            ttk.Radiobutton(self.fps_row, text=str(f), value=f, variable=self.var_fps)\
                 .pack(side="left", padx=(0, 8))
         r += 1
 
@@ -1493,18 +1611,6 @@ class App(tk.Tk):
             .pack(side="left", padx=(6, 0))
         r += 1
         ttk.Label(c, text="higher = better, bigger, slower to decode",
-                  style="Hint.TLabel")\
-            .grid(row=r, column=0, columnspan=2, sticky="w", padx=(10, 0)); r += 1
-
-        chf = ttk.Frame(c)
-        chf.grid(row=r, column=0, columnspan=2, sticky="w", padx=(10, 0),
-                 pady=(6, 0))
-        ttk.Label(chf, text="Colour").pack(side="left", padx=(0, 8))
-        for value, label, _why in CHROMA_CHOICES:
-            ttk.Radiobutton(chf, text=label, value=value,
-                            variable=self.var_chroma).pack(side="left", padx=(0, 8))
-        r += 1
-        ttk.Label(c, text="4:2:2 photo & video  ·  4:4:4 graphics & text",
                   style="Hint.TLabel")\
             .grid(row=r, column=0, columnspan=2, sticky="w", padx=(10, 0)); r += 1
 
@@ -1729,9 +1835,6 @@ class App(tk.Tk):
         try:
             p.fps = int(self.var_fps.get())
             p.quality = max(QUALITY_MIN, min(QUALITY_MAX, int(self.var_quality.get())))
-            chroma = self.var_chroma.get()
-            p.chroma = chroma if chroma in [c[0] for c in CHROMA_CHOICES] \
-                else CHROMA_DEFAULT
             p.sharpen = max(0.0, min(SHARPEN_MAX, float(self.var_sharpen.get())))
             p.fit = self.var_fit.get()
             p.crop_x = max(-1.0, min(1.0, float(self.var_crop_x.get())))
@@ -1740,6 +1843,8 @@ class App(tk.Tk):
             p.mirror_h = bool(self.var_mirror_h.get())
             p.mirror_v = bool(self.var_mirror_v.get())
             p.duration = max(0.1, float(self.var_duration.get()))
+            fmt = self.var_format.get()
+            p.out_format = fmt if fmt in [f[0] for f in OUT_FORMATS] else "avi"
         except (ValueError, tk.TclError):
             pass
         return p
@@ -1850,6 +1955,21 @@ class App(tk.Tk):
         self._update_enabled_state()
         self.schedule_preview()
 
+    def _on_format_change(self, *_):
+        if self._suspend_traces:
+            return
+        fmt = self.var_format.get()
+        if self.info:
+            self._format_by_kind[self.info.is_image] = fmt
+            # Keep the chosen name, swap only an extension this app writes.
+            out = self.var_output.get().strip()
+            if out:
+                base, ext = os.path.splitext(out)
+                if ext.lower() not in (".avi", ".jpg", ".jpeg"):
+                    base = out
+                self.var_output.set(output_path(base, self.info.path, fmt))
+        self._on_param_change()
+
     def _set_tree_state(self, widget, enabled):
         """Enable/disable every child of a container that understands -state.
 
@@ -1888,12 +2008,25 @@ class App(tk.Tk):
         self.lbl_pad.configure(state=pad_state)
 
         is_image = bool(self.info and self.info.is_image)
+        as_jpg = self.var_format.get() == "jpg"
+        # A video keeps its scrubber in JPEG mode: it picks the frame to save.
         if is_image:
             self.timeline.grid_remove()
-            self.dur_row.grid()
         else:
             self.timeline.grid()
+        if as_jpg:
+            self.fps_row.grid_remove()
+        else:
+            self.fps_row.grid()
+        if is_image and not as_jpg:
+            self.dur_row.grid()
+        else:
             self.dur_row.grid_remove()
+        self.var_format_hint.set(
+            "Resolution 172 × 320 (fixed)   ·   %s"
+            % ("MJPEG / AVI" if not as_jpg else
+               "baseline JPEG" if is_image or not has_file else
+               "JPEG of the frame shown"))
 
     def schedule_preview(self):
         self._update_command_text()
@@ -1917,8 +2050,10 @@ class App(tk.Tk):
         if not self.info or not self.info.ok:
             text = ""
         else:
-            text = quote_cmd(build_generate_cmd(self.info, self._collect_params(),
-                                                self.var_output.get() or "output.avi"))
+            p = self._collect_params()
+            text = quote_cmd(build_generate_cmd(
+                self.info, p, self.var_output.get() or ("output." + p.out_format),
+                at=self.timestamp))
         self.txt_cmd.configure(state="normal")
         self.txt_cmd.delete("1.0", "end")
         self.txt_cmd.insert("1.0", text)
@@ -1975,15 +2110,25 @@ class App(tk.Tk):
                     report = self._write_report(ctx, problems, rc, log, argv)
                     messagebox.showerror(
                         APP_TITLE,
-                        "ffmpeg finished, but this file will NOT play on the "
+                        "ffmpeg finished, but this file will NOT work on the "
                         "device:\n\n%s\n\n%s\n\n%s"
                         % ("\n".join("- " + s for s in problems), out,
                            ("A report was saved next to it:\n%s\n\nPlease send "
-                            "the report together with the video." % report)
+                            "the report together with the file." % report)
                            if report else "The report could not be saved."))
                     return
                 self.progress["value"] = 100
                 self.var_status.set("Done → " + os.path.basename(out))
+                if ctx["params"].out_format == "jpg":
+                    # The device decodes a JPEG straight from the card, not
+                    # through the player's frame buffer, so its size is not
+                    # capped: a bigger file only takes longer to draw.
+                    messagebox.showinfo(
+                        APP_TITLE, "Finished.\n\n%s\n\nChecked: baseline JPEG, "
+                        "%d x %d, %d bytes.\nffmpeg %s (%s)."
+                        % (out, OUT_W, OUT_H, os.path.getsize(out),
+                           self._ffmpeg_version or "?", self._ffmpeg_kind(ctx["ffmpeg"])))
+                    return
                 over, total, largest = frame_budget_report(out)
                 if over:
                     messagebox.showwarning(
@@ -1992,7 +2137,7 @@ class App(tk.Tk):
                         "player.\n\n%s\n\nThe player skips any frame over "
                         "%d bytes (width x height x 2 / 5); the largest here is "
                         "%d. Those frames will not be shown on the device.\n\n"
-                        "Lower Quality, or pick a coarser Colour setting, and "
+                        "Lower Quality or Sharpen, and "
                         "generate again."
                         % (over, total, out, FRAME_BUDGET_BYTES, largest))
                 else:
@@ -2272,14 +2417,12 @@ class App(tk.Tk):
         # the label narrow otherwise lets the trough run right up to it.
         self.lbl_time.configure(
             width=TIME_LABEL_WIDTH_H if info.duration >= 3600 else TIME_LABEL_WIDTH)
+        fmt = self._format_by_kind[info.is_image]
+        self.var_format.set(fmt)
         self._suspend_traces = False
         self.var_timelabel.set(format_time(0.0))
 
-        stem = os.path.splitext(os.path.basename(path))[0]
-        out = os.path.join(os.path.dirname(path), stem + ".avi")
-        if os.path.abspath(out) == os.path.abspath(path):
-            out = os.path.join(os.path.dirname(path), stem + "_esp32.avi")
-        self.var_output.set(out)
+        self.var_output.set(output_path(os.path.splitext(path)[0], path, fmt))
 
         self._update_enabled_state()
         self.schedule_preview()
@@ -2336,7 +2479,6 @@ class App(tk.Tk):
         self._suspend_traces = True
         self.var_fps.set(defaults.fps)
         self.var_quality.set(defaults.quality)
-        self.var_chroma.set(defaults.chroma)
         self.var_sharpen.set(defaults.sharpen)
         self.var_fit.set(defaults.fit)
         self.var_crop_x.set(defaults.crop_x)
@@ -2346,6 +2488,8 @@ class App(tk.Tk):
         self.var_mirror_h.set(defaults.mirror_h)
         self.var_mirror_v.set(defaults.mirror_v)
         self.var_duration.set(defaults.duration)
+        # The output format is left alone: like the output path, it says what
+        # to make, not how to process it.
         self._suspend_traces = False
         self.var_qualitylabel.set(str(defaults.quality))
         self.var_sharpenlabel.set(format_sharpen(defaults.sharpen))
@@ -2358,11 +2502,13 @@ class App(tk.Tk):
 
     def on_save_as(self):
         initial = self.var_output.get()
+        ext = "." + self._collect_params().out_format
         path = filedialog.asksaveasfilename(
-            title="Save output as", defaultextension=".avi",
-            initialfile=os.path.basename(initial) or "output.avi",
+            title="Save output as", defaultextension=ext,
+            initialfile=os.path.basename(initial) or "output" + ext,
             initialdir=os.path.dirname(initial) or os.getcwd(),
-            filetypes=[("AVI video", "*.avi")])
+            filetypes=[("JPEG image", "*.jpg") if ext == ".jpg"
+                       else ("AVI video", "*.avi")])
         if path:
             self.var_output.set(path)
             self._update_command_text()
@@ -2378,13 +2524,42 @@ class App(tk.Tk):
         if not out:
             messagebox.showwarning(APP_TITLE, "Choose an output path first.")
             return
-        if os.path.exists(out) and not messagebox.askyesno(
-                APP_TITLE, "%s already exists.\n\nOverwrite it?" % os.path.basename(out)):
-            return
-
         p = self._collect_params()
-        cmd = build_generate_cmd(self.info, p, out)
-        total = p.duration if self.info.is_image else self.info.duration
+        ext = "." + p.out_format
+        if os.path.splitext(out)[1].lower() != ext:
+            messagebox.showwarning(
+                APP_TITLE, "The output name must end in %s for the chosen "
+                "format." % ext)
+            return
+        try:
+            same = os.path.exists(out) and os.path.samefile(out, self.info.path)
+        except OSError:
+            same = False
+        if same:
+            messagebox.showwarning(
+                APP_TITLE, "The output would overwrite the source file.\n\n"
+                "Choose another name.")
+            return
+        if os.path.exists(out):
+            if not messagebox.askyesno(
+                    APP_TITLE, "%s already exists.\n\nOverwrite it?" % os.path.basename(out)):
+                return
+            if p.out_format == "jpg":
+                # A seek past the last frame makes ffmpeg exit 0 without
+                # writing anything, which would leave the old image to pass
+                # the read-back check; so the old one goes first.
+                try:
+                    os.remove(out)
+                except OSError as exc:
+                    messagebox.showerror(APP_TITLE, "Could not replace %s:\n\n%s"
+                                         % (os.path.basename(out), exc))
+                    return
+
+        cmd = build_generate_cmd(self.info, p, out, at=self.timestamp)
+        if p.out_format == "jpg":
+            total = 1.0   # one frame: progress only has to be non-zero
+        else:
+            total = p.duration if self.info.is_image else self.info.duration
 
         self.progress["value"] = 0
         self.var_status.set("Encoding…")

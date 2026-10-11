@@ -8,8 +8,8 @@ description: Start here for any analysis, review, question or change in the NDXV
 ## What this repo is
 
 A single-file Tkinter GUI (`ndxvo_converter.py`) that turns any video or still
-into a 172 x 320 MJPEG-in-AVI clip an ESP32 board plays from an SD card. It
-generalises this reference command:
+into a 172 x 320 MJPEG-in-AVI clip, or a single baseline JPEG, that an ESP32
+board shows from an SD card. It generalises this reference command:
 
     ffmpeg -y -i input5.mp4 -an -pix_fmt yuvj420p -c:v mjpeg -q:v 2 -vf "fps=30,scale=-2:320:flags=lanczos,crop=172:320:(in_w-172)/2:0,hflip,vflip" video5.avi
 
@@ -45,7 +45,7 @@ on macOS/Linux; run from the repo root):
 
 ## Sections of the app, top to bottom
 
-1. **Constants**: output size, frame budget, mockup geometry, quality table, chroma choices, sharpen, `MOCKUP_B64`.
+1. **Constants**: output size, frame budget, mockup geometry, quality table, fixed `PIX_FMT`, output formats, sharpen, `MOCKUP_B64`.
 2. **Subprocess helpers**: `find_ffmpeg` (bundled `_MEIPASS` -> next to the script -> frozen exe dir / `.app` Resources -> PATH -> Homebrew paths), `run_capture`, `_no_window_kwargs` (no console flash on Windows).
 3. **Media probing**: `probe` parses `ffmpeg -i` stderr (no ffprobe is shipped), the EXIF orientation table, `avi_frame_sizes` / `frame_budget_report`, quality and format helpers.
 4. **Filter chain**: `Params`, `scaled_size`, `build_vf`, `build_generate_cmd`, `quote_cmd`.
@@ -62,15 +62,16 @@ on macOS/Linux; run from the repo root):
                           _extract_processed (same build_vf without fps, same mjpeg / -q:v / -pix_fmt as export)
       -> results queue -> _poll_results (main thread, every 40 ms) -> _apply_render (drops stale seq)
       -> _compose_device (undo panel rotation, paste with rounded mask into the photo)
-    Generate -> build_generate_cmd -> Encoder thread -> encode_progress / encode_done
-      -> frame_budget_report(out) -> warning if any frame exceeds FRAME_BUDGET_BYTES
+    Generate -> build_generate_cmd(info, p, out, at=timestamp) -> Encoder thread -> encode_progress / encode_done
+      -> verify_output(out, p) -> AVI: frame_budget_report(out), warning if any frame exceeds FRAME_BUDGET_BYTES
+                               JPEG: jpeg_frame_header(out) must be SOF0 (baseline), no size limit
 
 ## Invariants (check every change against these)
 
 | # | Rule | Why |
 |---|---|---|
 | 1 | One file; stdlib + tkinter + Pillow only (ffmpeg external) | Owner requirement: trivial to run on a Mac; this is also why the photo is embedded |
-| 2 | Output is locked to 172x320, MJPEG, AVI, `-an` | Anything else will not play on the device |
+| 2 | Output is locked to 172x320 MJPEG: an AVI with `-an`, or (`Params.out_format = "jpg"`) one baseline JPEG written with `-frames:v 1 -f image2 -update 1` | Anything else will not play on the device; JPEGDEC cannot decode progressive |
 | 3 | For 0/180 rotation the orientation filters go last; for 90/270 the transpose goes first | Keeps the chain byte-identical to the reference command (lanczos before and after a flip differs) |
 | 4 | When orientation runs last, crop offsets are sign-compensated | Crop sliders keep one meaning whatever the filter order |
 | 5 | The intermediate scale size is computed in Python (`scaled_size`, `_even`), never `force_original_aspect_ratio` | Exact, readable geometry |
@@ -81,6 +82,7 @@ on macOS/Linux; run from the repo root):
 | 10 | `APP_VERSION = "<value>"` stays one line in exactly that form | CI rewrites it (`stamp_version.py`) |
 | 11 | Worker threads never touch Tk; they only post to `self.results` | Tk is not thread-safe |
 | 12 | Python 3.9+ syntax; subprocesses on Windows use `_no_window_kwargs()` | Supported runtimes; no console flashes |
+| 13 | Chroma is always `PIX_FMT = "yuvj420p"`; never offer 4:2:2 / 4:4:4 | JPEGDEC assumes Cb/Cr 1x1, ffmpeg writes them 1x2: decode error on the device (see ndxvo-frame-budget) |
 
 ## Adding or changing a user parameter: the plumbing checklist
 
@@ -111,7 +113,7 @@ some path:
 | Task | Skill |
 |---|---|
 | What command does the app emit; rotation, crop, fit or EXIF bugs; refactoring `build_vf` | ndxvo-filter-chain |
-| Will this file play on the device; black frames; quality and colour choices | ndxvo-frame-budget |
+| Will this file play on the device; black frames; "Invalid image file"; quality and chroma | ndxvo-frame-budget |
 | Preview mockup misaligned, corner radius, replacing the device photo | ndxvo-device-mockup |
 | GitHub Actions, versions, releases, `.dmg` / `.exe`, Gatekeeper | ndxvo-build-pipeline |
 | Is the README still true? | ndxvo-docs-drift |
