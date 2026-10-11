@@ -34,6 +34,15 @@ encode slightly differently, which is expected).
 - Output resolution is locked to 172 × 320 MJPEG/AVI, so you cannot accidentally
   produce a file the device will not play. FPS (30 / 25) and JPEG quality remain
   adjustable.
+- Every export is read back before it is reported as done: it must be MJPEG,
+  tagged `MJPG`, 172 × 320, at the chosen FPS. If it is not, the app says exactly
+  what is wrong and saves `<name>_report.txt` next to the video — app version,
+  system, ffmpeg path and version, the exact command, and the full ffmpeg log —
+  so a bad file can be diagnosed without anyone touching a terminal.
+- The ffmpeg in use is always shown in its own row, with full path and version,
+  and can be changed there (`Browse…`, or type a path; `Use built-in` goes back).
+  A candidate is actually started and must have the MJPEG encoder before it is
+  accepted.
 
 ---
 
@@ -47,13 +56,26 @@ pip install pillow
 python ndxvo_converter.py
 ```
 
-ffmpeg is located in this order: bundled inside the packaged app → next to the
-script → on `PATH` → the usual Homebrew locations.
+From source, ffmpeg is looked up next to the script, then on `PATH`, then in the
+usual Homebrew locations. The packaged app never does this: it uses only the
+ffmpeg bundled inside it, so every user encodes with the same tested binary. If
+that copy is missing, the app reports a damaged install rather than silently
+picking up whatever ffmpeg the machine happens to have.
+
+A different ffmpeg is used only when someone picks it in the ffmpeg row. That
+choice is remembered in `settings.json` (macOS: `~/Library/Application
+Support/NDXVO Media Converter/`, Windows: `%APPDATA%\NDXVO Media Converter\`);
+if it later stops working, the app says so and returns to the built-in one.
 
 - Windows: `winget install Gyan.FFmpeg`
 - macOS: `brew install ffmpeg`
 
 You can also pass a file on the command line: `python ndxvo_converter.py clip.mp4`
+
+On Windows, double-click `run.bat` instead. It finds Python (a `.venv` in the
+project first, then `py`, then `python`), installs Pillow if it is missing, and
+starts the app without a console window. To open a clip straight away, drag it
+onto `run.bat`.
 
 ---
 

@@ -19,7 +19,9 @@ Requires: Python 3.9+, Pillow, and ffmpeg (bundled, on PATH, or beside the app).
 
 import base64
 import io
+import json
 import os
+import platform
 import queue
 import re
 import struct
@@ -420,25 +422,61 @@ def _no_window_kwargs():
     return {}
 
 
-def find_ffmpeg():
-    """Locate ffmpeg: bundled in the frozen app, beside the script, then PATH."""
-    exe = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
-
-    roots = []
+def _bundled_ffmpeg_dirs():
+    """Folders where a packaged build keeps its own ffmpeg, most likely first."""
+    dirs = []
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
-        roots.append(meipass)
-    roots.append(os.path.dirname(os.path.abspath(sys.argv[0])))
-    if getattr(sys, "frozen", False):
-        # Inside a macOS .app bundle: Contents/MacOS/<exe> -> Contents/Resources
-        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
-        roots.append(exe_dir)
-        roots.append(os.path.join(os.path.dirname(exe_dir), "Resources"))
+        # Windows one-file: the temp folder the .exe unpacks into.
+        # macOS .app (PyInstaller 6+): Contents/Frameworks.
+        dirs.append(meipass)
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    contents = os.path.dirname(exe_dir)  # macOS: Contents/MacOS -> Contents
+    dirs += [exe_dir,
+             os.path.join(contents, "Frameworks"),
+             os.path.join(contents, "Resources")]
+    return dirs
 
-    for root in roots:
-        cand = os.path.join(root, exe)
-        if os.path.isfile(cand) and os.access(cand, os.X_OK):
-            return cand
+
+def _ensure_executable(path):
+    """Restore the execute bit if a copy or an unzip dropped it.
+
+    Best effort: if it cannot be fixed, starting ffmpeg fails with a clear
+    "Permission denied" instead of the app quietly using some other ffmpeg.
+    """
+    if os.name == "nt" or os.access(path, os.X_OK):
+        return
+    try:
+        os.chmod(path, os.stat(path).st_mode | 0o111)
+    except OSError:
+        pass
+
+
+def find_ffmpeg():
+    """Locate the ffmpeg binary the app runs.
+
+    A packaged build uses ONLY the ffmpeg shipped inside it and never falls
+    back to one installed on the machine.  A fallback would make the output
+    depend on a binary nobody tested with this app, with no sign to the user
+    that anything was different.  A missing bundled copy is reported as a
+    damaged install instead (see App._warn_no_ffmpeg).
+
+    Running from source keeps the developer fallbacks: beside the script, on
+    PATH, then the usual Homebrew locations.
+    """
+    exe = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+
+    if getattr(sys, "frozen", False):
+        for d in _bundled_ffmpeg_dirs():
+            cand = os.path.join(d, exe)
+            if os.path.isfile(cand):
+                _ensure_executable(cand)
+                return cand
+        return None
+
+    cand = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), exe)
+    if os.path.isfile(cand) and os.access(cand, os.X_OK):
+        return cand
 
     found = shutil.which("ffmpeg")
     if found:
@@ -451,6 +489,9 @@ def find_ffmpeg():
 
 
 FFMPEG = find_ffmpeg()
+# What this copy found on its own (in a packaged build: the bundled binary).
+# FFMPEG itself can be switched to a custom binary from the window.
+FFMPEG_BUILTIN = FFMPEG
 
 
 def run_capture(args, timeout=30):
@@ -468,6 +509,74 @@ def run_capture(args, timeout=30):
         proc.kill()
         out, err = proc.communicate()
     return proc.returncode, out, err.decode("utf-8", "replace")
+
+
+def ffmpeg_identity(path):
+    """Start an ffmpeg binary to prove it works here: (ok, version, problem).
+
+    Existing on disk is not enough - a binary can be for the wrong CPU, be
+    blocked by the OS, or not be ffmpeg at all - so it is actually run, and it
+    must have the MJPEG encoder the export depends on.
+    """
+    if not path:
+        return False, "", "no ffmpeg found"
+    if not os.path.isfile(path):
+        return False, "", "file does not exist"
+    try:
+        # Generous timeout: the first start of a downloaded binary can be held
+        # up by the OS scanning it.
+        rc, out, err = run_capture([path, "-hide_banner", "-version"], timeout=60)
+    except OSError as exc:
+        return False, "", "cannot be started (%s)" % exc
+    lines = out.decode("utf-8", "replace").splitlines()
+    first = lines[0].strip() if lines else ""
+    if rc != 0 or not first.startswith("ffmpeg version"):
+        detail = first or (err.strip().splitlines() or ["exit code %s" % rc])[-1]
+        return False, "", "not a working ffmpeg (%s)" % detail[:120]
+    parts = first.split()
+    version = parts[2] if len(parts) > 2 else "?"
+    try:
+        _, out, _ = run_capture([path, "-hide_banner", "-encoders"], timeout=60)
+    except OSError as exc:
+        return False, version, "cannot be started (%s)" % exc
+    if not re.search(r"^\s*V\S*\s+mjpeg\s", out.decode("utf-8", "replace"), re.M):
+        return False, version, "this ffmpeg has no MJPEG encoder"
+    return True, version, ""
+
+
+# --------------------------------------------------------------------------
+# Settings (only the custom ffmpeg path, for now)
+# --------------------------------------------------------------------------
+
+def _settings_path():
+    if sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    elif os.name == "nt":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, APP_TITLE, "settings.json")
+
+
+def load_settings():
+    try:
+        with io.open(_settings_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(data):
+    path = _settings_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with io.open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+    except OSError:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -647,6 +756,54 @@ def frame_budget_report(path):
         return 0, 0, 0
     over = sum(1 for v in sizes if v > FRAME_BUDGET_BYTES)
     return over, len(sizes), max(sizes)
+
+
+def avi_video_fourcc(path):
+    """Handler FourCC of the AVI's video stream ('MJPG', 'FMP4', ...).
+
+    This is the tag the player looks at before it decodes anything.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(65536)
+    except OSError:
+        return ""
+    i = head.find(b"strh")
+    while i != -1:
+        if head[i + 8:i + 12] == b"vids":
+            return head[i + 12:i + 16].decode("latin-1")
+        i = head.find(b"strh", i + 4)
+    return ""
+
+
+def verify_output(path, p):
+    """Read a finished file back and list what makes it unusable on the device.
+
+    An empty list means MJPEG, tagged MJPG, 172 x 320, at the chosen frame
+    rate.  It inspects the file itself, not the command that produced it.
+    """
+    if not os.path.isfile(path):
+        return ["the output file was not created"]
+    if os.path.getsize(path) == 0:
+        return ["the output file is empty"]
+    got = probe(path)
+    if not got.ok:
+        return ["the output file cannot be read back (%s)" % got.error]
+    problems = []
+    if got.codec != "mjpeg":
+        problems.append("video codec is %s, the device needs mjpeg"
+                        % (got.codec or "unknown"))
+    fourcc = avi_video_fourcc(path)
+    if fourcc.upper() != "MJPG":
+        problems.append("AVI video tag is %s, the device needs MJPG"
+                        % (repr(fourcc) if fourcc else "missing"))
+    if (got.width, got.height) != (OUT_W, OUT_H):
+        problems.append("resolution is %d x %d, the device needs %d x %d"
+                        % (got.width, got.height, OUT_W, OUT_H))
+    if got.fps and abs(got.fps - p.fps) > 0.01:
+        problems.append("frame rate is %.3f fps, %d fps was chosen"
+                        % (got.fps, p.fps))
+    return problems
 
 
 def qscale_for(level):
@@ -1018,8 +1175,17 @@ class Encoder(threading.Thread):
                 **_no_window_kwargs()
             )
         except Exception as exc:
-            self.out_queue.put(("encode_done", False, str(exc)))
+            self.out_queue.put(("encode_done", False, str(exc), None, "", cmd))
             return
+
+        # stderr is drained on its own thread and kept whole for the report:
+        # ffmpeg can log more than a pipe buffer holds, and blocking on a full
+        # pipe would stall the encode.
+        err_chunks = []
+        drain = threading.Thread(
+            target=lambda: err_chunks.extend(iter(self.proc.stderr.readline, b"")),
+            daemon=True)
+        drain.start()
 
         for raw in iter(self.proc.stdout.readline, b""):
             line = raw.decode("utf-8", "replace").strip()
@@ -1031,16 +1197,18 @@ class Encoder(threading.Thread):
                 except ValueError:
                     pass
 
-        err = self.proc.stderr.read().decode("utf-8", "replace")
         rc = self.proc.wait()
+        drain.join(10)
+        err = b"".join(err_chunks).decode("utf-8", "replace")
 
         if self._cancelled:
-            self.out_queue.put(("encode_done", False, "cancelled"))
+            self.out_queue.put(("encode_done", False, "cancelled", rc, err, cmd))
         elif rc == 0:
-            self.out_queue.put(("encode_done", True, ""))
+            self.out_queue.put(("encode_done", True, "", rc, err, cmd))
         else:
             tail = "\n".join([l for l in err.strip().splitlines() if l][-6:])
-            self.out_queue.put(("encode_done", False, tail or ("ffmpeg exited with %d" % rc)))
+            self.out_queue.put(("encode_done", False,
+                                tail or ("ffmpeg exited with %d" % rc), rc, err, cmd))
 
 
 # --------------------------------------------------------------------------
@@ -1067,6 +1235,12 @@ class App(tk.Tk):
         self._device_pil = None
         self._last_canvas_size = {}
         self.encoder = None
+        self._gen_ctx = None
+        self.settings = load_settings()
+        self._ffmpeg_shown = ""     # path the ffmpeg row currently stands for
+        self._ffmpeg_version = ""
+        self._ffmpeg_pending = None  # path being checked right now
+        self._ffmpeg_state = (None, "", "not checked yet")  # what the row shows
 
         self.results = queue.Queue()
         self.renderer = Renderer(self.results)
@@ -1086,8 +1260,7 @@ class App(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        if not FFMPEG:
-            self.after(300, self._warn_no_ffmpeg)
+        self._init_ffmpeg()
 
     # -- variables ---------------------------------------------------------
 
@@ -1110,6 +1283,8 @@ class App(tk.Tk):
         self.var_output = tk.StringVar(value="")
         self.var_status = tk.StringVar(value="Ready")
         self.var_command = tk.StringVar(value="")
+        self.var_ffmpeg_path = tk.StringVar(value=FFMPEG or "")
+        self.var_ffmpeg_info = tk.StringVar(value="checking…")
         self.var_timelabel = tk.StringVar(value="00:00.000")
         self.var_crop_x_label = tk.StringVar(value=format_crop(p.crop_x))
         self.var_crop_y_label = tk.StringVar(value=format_crop(p.crop_y))
@@ -1140,6 +1315,7 @@ class App(tk.Tk):
                   background=[("disabled", "#ebebeb")],
                   arrowcolor=[("disabled", "#9a9a9a")])
         style.configure("Hint.TLabel", foreground="#666666")
+        style.configure("Bad.TLabel", foreground="#b00020")
         style.configure("Head.TLabel", font=("TkDefaultFont", 10, "bold"))
 
         root = ttk.Frame(self, padding=10)
@@ -1398,9 +1574,29 @@ class App(tk.Tk):
         bottom.grid(row=2, column=0, sticky="ew", pady=(10, 0))
         bottom.columnconfigure(0, weight=1)
 
+        # Which ffmpeg runs: always on screen, and the one place to change it.
+        # Kept outside the command frame so it stays usable with no file open.
+        ffr = ttk.Frame(bottom)
+        ffr.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        ffr.columnconfigure(1, weight=1)
+        ttk.Label(ffr, text="ffmpeg").grid(row=0, column=0, padx=(0, 8))
+        self.ent_ffmpeg = ttk.Entry(ffr, textvariable=self.var_ffmpeg_path)
+        self.ent_ffmpeg.grid(row=0, column=1, sticky="ew")
+        self.ent_ffmpeg.bind("<Return>", lambda _e: self.on_ffmpeg_entry())
+        self.ent_ffmpeg.bind("<FocusOut>", lambda _e: self.on_ffmpeg_entry())
+        self.btn_ffmpeg_browse = ttk.Button(ffr, text="Browse…",
+                                            command=self.on_ffmpeg_browse)
+        self.btn_ffmpeg_browse.grid(row=0, column=2, padx=(8, 0))
+        self.btn_ffmpeg_builtin = ttk.Button(ffr, text="Use built-in",
+                                             command=self.on_ffmpeg_builtin)
+        self.btn_ffmpeg_builtin.grid(row=0, column=3, padx=(8, 0))
+        self.lbl_ffmpeg = ttk.Label(ffr, textvariable=self.var_ffmpeg_info,
+                                    width=34, anchor="w")
+        self.lbl_ffmpeg.grid(row=0, column=4, padx=(10, 0))
+
         # command line
         cmdf = ttk.LabelFrame(bottom, text="ffmpeg command", padding=6)
-        cmdf.grid(row=0, column=0, sticky="ew")
+        cmdf.grid(row=1, column=0, sticky="ew")
         self.frame_cmd = cmdf
         cmdf.columnconfigure(0, weight=1)
         self.txt_cmd = tk.Text(cmdf, height=3, wrap="word", relief="flat",
@@ -1412,7 +1608,7 @@ class App(tk.Tk):
 
         # output + generate
         out = ttk.Frame(bottom)
-        out.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        out.grid(row=2, column=0, sticky="ew", pady=(10, 0))
         out.columnconfigure(1, weight=1)
         self.frame_out = out
         ttk.Label(out, text="Output").grid(row=0, column=0, padx=(0, 8))
@@ -1424,7 +1620,7 @@ class App(tk.Tk):
         self.btn_generate.grid(row=0, column=3, padx=(12, 0))
 
         prog = ttk.Frame(bottom)
-        prog.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        prog.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         prog.columnconfigure(0, weight=1)
         self.progress = ttk.Progressbar(prog, mode="determinate", maximum=100.0)
         self.progress.grid(row=0, column=0, sticky="ew")
@@ -1760,13 +1956,33 @@ class App(tk.Tk):
         if kind == "encode_progress":
             self.progress["value"] = item[1]
             self.var_status.set("Encoding… %d%%" % int(item[1]))
+        elif kind == "ffmpeg_checked":
+            self._on_ffmpeg_checked(*item[1:])
         elif kind == "encode_done":
-            ok, msg = item[1], item[2]
+            _, ok, msg, rc, log, argv = item
+            ctx = self._gen_ctx or {}
             self.encoder = None
             self.btn_generate.configure(text="Generate", state="normal")
+            self._set_ffmpeg_row_enabled(True)
             if ok:
+                out = ctx.get("out") or self.var_output.get()
+                # Check the file itself before calling it done: a finished
+                # ffmpeg run is not proof that the result suits the device.
+                problems = verify_output(out, ctx["params"]) if ctx else []
+                if problems:
+                    self.progress["value"] = 0
+                    self.var_status.set("Wrong output - see the report")
+                    report = self._write_report(ctx, problems, rc, log, argv)
+                    messagebox.showerror(
+                        APP_TITLE,
+                        "ffmpeg finished, but this file will NOT play on the "
+                        "device:\n\n%s\n\n%s\n\n%s"
+                        % ("\n".join("- " + s for s in problems), out,
+                           ("A report was saved next to it:\n%s\n\nPlease send "
+                            "the report together with the video." % report)
+                           if report else "The report could not be saved."))
+                    return
                 self.progress["value"] = 100
-                out = self.var_output.get()
                 self.var_status.set("Done → " + os.path.basename(out))
                 over, total, largest = frame_budget_report(out)
                 if over:
@@ -1784,18 +2000,233 @@ class App(tk.Tk):
                     if total:
                         extra = ("\n\nLargest frame %d bytes of the %d the "
                                  "player allows." % (largest, FRAME_BUDGET_BYTES))
-                    messagebox.showinfo(APP_TITLE, "Finished.\n\n%s%s" % (out, extra))
+                    messagebox.showinfo(
+                        APP_TITLE, "Finished.\n\n%s%s\n\nChecked: MJPEG, %d x %d, "
+                        "%d fps.\nffmpeg %s (%s)."
+                        % (out, extra, OUT_W, OUT_H, ctx["params"].fps,
+                           self._ffmpeg_version or "?", self._ffmpeg_kind(ctx["ffmpeg"])))
             else:
                 self.progress["value"] = 0
                 if msg == "cancelled":
                     self.var_status.set("Cancelled")
                 else:
                     self.var_status.set("Failed")
-                    messagebox.showerror(APP_TITLE, "Encoding failed:\n\n%s" % msg)
+                    first = (msg.strip().splitlines() or ["unknown error"])[-1]
+                    report = (self._write_report(ctx, ["ffmpeg failed: " + first],
+                                                 rc, log, argv) if ctx else None)
+                    messagebox.showerror(
+                        APP_TITLE, "Encoding failed:\n\n%s%s"
+                        % (msg, ("\n\nA report was saved:\n%s" % report)
+                           if report else ""))
+
+    # -- ffmpeg selection --------------------------------------------------
+
+    def _ffmpeg_kind(self, path):
+        return "built-in" if path and path == FFMPEG_BUILTIN else "custom"
+
+    def _init_ffmpeg(self):
+        """Choose this session's ffmpeg and prove it starts.
+
+        A custom binary saved earlier wins, otherwise the built-in one.  Either
+        way the outcome is shown in the ffmpeg row rather than assumed.
+        """
+        custom = self.settings.get("ffmpeg_path") or ""
+        if custom and custom != FFMPEG_BUILTIN:
+            self.var_ffmpeg_path.set(custom)
+            self._check_ffmpeg(custom, on_fail="revert")
+        elif FFMPEG_BUILTIN:
+            self._check_ffmpeg(FFMPEG_BUILTIN, on_fail="report")
+        else:
+            self._show_ffmpeg(None, "", "built-in ffmpeg missing")
+            self.after(300, self._warn_no_ffmpeg)
+
+    def _check_ffmpeg(self, path, on_fail):
+        """Run ffmpeg_identity off the UI thread; the answer arrives via results.
+
+        on_fail: "reject" - the user just picked it, keep the current one;
+                 "revert" - the saved custom one broke, go back to built-in;
+                 "report" - it is the one in use, show why it does not start.
+        """
+        self._ffmpeg_pending = path
+        self.var_ffmpeg_info.set("checking…")
+        self.lbl_ffmpeg.configure(style="TLabel")
+
+        def work():
+            ok, version, problem = ffmpeg_identity(path)
+            self.results.put(("ffmpeg_checked", path, ok, version, problem, on_fail))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_ffmpeg_checked(self, path, ok, version, problem, on_fail):
+        global FFMPEG
+        self._ffmpeg_pending = None
+        if ok:
+            FFMPEG = path
+            self._show_ffmpeg(path, version, "")
+            if path == FFMPEG_BUILTIN:
+                self.settings.pop("ffmpeg_path", None)
+            else:
+                self.settings["ffmpeg_path"] = path
+            save_settings(self.settings)
+            if self.info and self.info.ok:
+                self.schedule_preview()   # what is on screen came from the old binary
+            return
+        if on_fail == "reject":
+            self._show_ffmpeg(*self._ffmpeg_state)
+            messagebox.showerror(
+                APP_TITLE, "This file can't be used as ffmpeg:\n\n%s\n%s\n\n"
+                "Still using:\n%s" % (path, problem, FFMPEG or "no ffmpeg"))
+        elif on_fail == "revert":
+            self.settings.pop("ffmpeg_path", None)
+            save_settings(self.settings)
+            messagebox.showwarning(
+                APP_TITLE, "The custom ffmpeg chosen earlier can no longer be "
+                "used:\n\n%s\n%s\n\nSwitching back to the built-in ffmpeg."
+                % (path, problem))
+            if FFMPEG_BUILTIN:
+                self._check_ffmpeg(FFMPEG_BUILTIN, on_fail="report")
+            else:
+                self._show_ffmpeg(None, "", "built-in ffmpeg missing")
+                self._warn_no_ffmpeg()
+        else:
+            FFMPEG = path
+            self._show_ffmpeg(path, version, problem)
+            messagebox.showerror(
+                APP_TITLE, "The %s ffmpeg can't be started:\n\n%s\n%s\n\n"
+                "Previews and Generate will fail until this is fixed. Download "
+                "the app again, or choose another ffmpeg in the ffmpeg row at "
+                "the bottom of the window."
+                % (self._ffmpeg_kind(path), path, problem))
+
+    def _show_ffmpeg(self, path, version, problem):
+        self._ffmpeg_state = (path, version, problem)
+        self._ffmpeg_shown = path or ""
+        self._ffmpeg_version = version
+        self.var_ffmpeg_path.set(path or "")
+        if problem:
+            self.var_ffmpeg_info.set("NOT WORKING: " + problem)
+            self.lbl_ffmpeg.configure(style="Bad.TLabel")
+        else:
+            self.var_ffmpeg_info.set("ffmpeg %s · %s" % (version, self._ffmpeg_kind(path)))
+            self.lbl_ffmpeg.configure(style="TLabel")
+        self.btn_ffmpeg_builtin.configure(
+            state="normal" if FFMPEG_BUILTIN and path != FFMPEG_BUILTIN else "disabled")
+        self._update_command_text()
+
+    def _set_ffmpeg_row_enabled(self, enabled):
+        state = "normal" if enabled else "disabled"
+        for w in (self.ent_ffmpeg, self.btn_ffmpeg_browse):
+            w.configure(state=state)
+        self.btn_ffmpeg_builtin.configure(
+            state="normal" if enabled and FFMPEG_BUILTIN
+            and self._ffmpeg_shown != FFMPEG_BUILTIN else "disabled")
+
+    def _request_ffmpeg(self, path):
+        if self.encoder is not None:
+            return
+        path = os.path.abspath(os.path.expanduser(path))
+        if path in (self._ffmpeg_shown, self._ffmpeg_pending):
+            self.var_ffmpeg_path.set(path)
+            return
+        self.var_ffmpeg_path.set(path)
+        self._check_ffmpeg(path, on_fail="reject")
+
+    def on_ffmpeg_entry(self):
+        path = self.var_ffmpeg_path.get().strip().strip('"')
+        if not path:
+            self.var_ffmpeg_path.set(self._ffmpeg_pending or self._ffmpeg_shown)
+            return
+        self._request_ffmpeg(path)
+
+    def on_ffmpeg_browse(self):
+        kwargs = {"title": "Choose the ffmpeg program"}
+        if os.name == "nt":
+            kwargs["filetypes"] = [("ffmpeg", "ffmpeg.exe"), ("Programs", "*.exe"),
+                                   ("All files", "*.*")]
+        start = os.path.dirname(self._ffmpeg_shown) if self._ffmpeg_shown else ""
+        if start and os.path.isdir(start):
+            kwargs["initialdir"] = start
+        path = filedialog.askopenfilename(**kwargs)
+        if path:
+            self._request_ffmpeg(path)
+
+    def on_ffmpeg_builtin(self):
+        if FFMPEG_BUILTIN:
+            self._request_ffmpeg(FFMPEG_BUILTIN)
+
+    def _write_report(self, ctx, problems, rc, log, argv):
+        """Save everything needed to diagnose a bad export, next to the output.
+
+        Returns the report path, or None if it could not be written anywhere.
+        """
+        out = ctx.get("out", "")
+        info, p, ff = ctx.get("info"), ctx.get("params"), ctx.get("ffmpeg")
+        ok_ff, ff_version, ff_problem = ffmpeg_identity(ff)
+        try:
+            readback = run_capture([ff, "-hide_banner", "-i", out])[2] if ff else ""
+        except OSError as exc:
+            readback = "could not run ffmpeg: %s" % exc
+        size = os.path.getsize(out) if out and os.path.isfile(out) else -1
+        lines = [
+            "%s v%s - conversion report" % (APP_TITLE, APP_VERSION),
+            "Created:   %s" % time.strftime("%Y-%m-%d %H:%M:%S"),
+            "System:    %s (%s), Python %s, packaged app: %s"
+            % (platform.platform(), platform.machine(), platform.python_version(),
+               "yes" if getattr(sys, "frozen", False) else "no"),
+            "",
+            "ffmpeg used:     %s" % ff,
+            "ffmpeg version:  %s" % (ff_version or ff_problem),
+            "ffmpeg kind:     %s" % self._ffmpeg_kind(ff),
+            "built-in ffmpeg: %s" % (FFMPEG_BUILTIN or "missing"),
+            "",
+            "Source:    %s" % (info.path if info else "?"),
+            "           %s, codec %s" % ((info.summary, info.codec or "?") if info else ("?", "?")),
+            "Output:    %s (%d bytes)" % (out, size),
+            "",
+            "Problems:",
+        ] + ["  - " + s for s in problems] + [
+            "",
+            "Settings:  " + (", ".join("%s=%s" % kv for kv in sorted(vars(p).items()))
+                             if p else "?"),
+            "",
+            "Command, exactly as started:",
+            "  " + (quote_cmd(argv) if argv else "?"),
+            "ffmpeg exit code: %s" % rc,
+            "",
+            "---- output file as read back by ffmpeg ----",
+            (readback or "").strip(),
+            "",
+            "---- ffmpeg log ----",
+            (log or "").strip(),
+            "",
+        ]
+        text = "\n".join(lines)
+        name = os.path.splitext(os.path.basename(out) or "output")[0] + "_report.txt"
+        for folder in (os.path.dirname(os.path.abspath(out)) if out else "",
+                       os.path.expanduser("~")):
+            if not folder:
+                continue
+            target = os.path.join(folder, name)
+            try:
+                with io.open(target, "w", encoding="utf-8") as f:
+                    f.write(text)
+                return target
+            except OSError:
+                continue
+        return None
 
     # -- actions -----------------------------------------------------------
 
     def _warn_no_ffmpeg(self):
+        if getattr(sys, "frozen", False):
+            # The packaged app ships its own ffmpeg and deliberately refuses to
+            # use any other, so getting here means this copy is damaged.
+            messagebox.showerror(
+                APP_TITLE,
+                "This copy of the app is incomplete: its built-in ffmpeg is "
+                "missing.\n\n"
+                "Download the app again and replace this copy, or choose an "
+                "ffmpeg program in the ffmpeg row at the bottom of the window.")
+            return
         messagebox.showwarning(
             APP_TITLE,
             "ffmpeg was not found.\n\n"
@@ -1958,6 +2389,9 @@ class App(tk.Tk):
         self.progress["value"] = 0
         self.var_status.set("Encoding…")
         self.btn_generate.configure(text="Cancel")
+        self._set_ffmpeg_row_enabled(False)
+        self._gen_ctx = {"out": out, "params": p, "info": self.info,
+                         "ffmpeg": FFMPEG}
         self.encoder = Encoder(cmd, total, self.results)
         self.encoder.start()
 
