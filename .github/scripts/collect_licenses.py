@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Collect the third-party license texts that ship inside a build.
 
-The bundled ffmpeg is GPL, so every binary has to carry its license text, a
-note of exactly which build it is, and directions to its source code. This
+The bundled ffmpeg is GPL (full builds) or LGPL (lite builds), so every binary
+has to carry its license text, a note of exactly which build it is, and
+directions to its source code. This
 script assembles all of that into one folder, which the build then embeds in
 the app, copies into the .dmg and attaches to the GitHub Release:
 
@@ -13,12 +14,20 @@ the app, copies into the .dmg and attaches to the GitHub Release:
     <out>/Python/LICENSE.txt        from the running interpreter, if present
 
 It fails the build when the bundled ffmpeg is not the release whose source the
-Release attaches (FFMPEG_SOURCE_VERSION in build.yml), or when it was built
-with --enable-nonfree and so may not be redistributed at all. Usage:
+Release attaches (FFMPEG_SOURCE_VERSION or FFMPEG_LITE_VERSION in build.yml),
+or when it was built with --enable-nonfree and so may not be redistributed at
+all. Usage, for the imageio-ffmpeg build and for the lite build:
 
     python .github/scripts/collect_licenses.py --ffmpeg vendor/ffmpeg \\
         --platform "macOS arm64" --app-version 1.2.0 \\
         --ffmpeg-source-version 7.1 --imageio-ffmpeg-version 0.6.0 \\
+        --release-url https://github.com/<owner>/<repo>/releases/tag/v1.2.0 \\
+        --out vendor/licenses
+
+    python .github/scripts/collect_licenses.py --ffmpeg vendor/ffmpeg \\
+        --platform "macOS arm64 lite" --app-version 1.2.0 \\
+        --ffmpeg-source-version 7.1.5 \\
+        --built-with .github/scripts/build-ffmpeg-lite.sh \\
         --release-url https://github.com/<owner>/<repo>/releases/tag/v1.2.0 \\
         --out vendor/licenses
 """
@@ -63,8 +72,9 @@ def ffmpeg_info(ffmpeg, expected_version):
     release = re.match(r"n?(\d+(?:\.\d+)+)", full_version)
     if release is None or release.group(1) != expected_version:
         sys.exit("error: bundled ffmpeg is %s, but the Release attaches the source of "
-                 "FFmpeg %s. Update FFMPEG_SOURCE_VERSION / FFMPEG_SOURCE_SHA256 in "
-                 "build.yml together with IMAGEIO_FFMPEG_VERSION."
+                 "FFmpeg %s. In build.yml, update FFMPEG_SOURCE_VERSION / "
+                 "FFMPEG_SOURCE_SHA256 together with IMAGEIO_FFMPEG_VERSION, or "
+                 "FFMPEG_LITE_VERSION / FFMPEG_LITE_SHA256 for the lite build."
                  % (full_version, expected_version))
 
     config = re.search(r"^configuration:(.*)$", out, re.M)
@@ -84,14 +94,29 @@ def ffmpeg_info(ffmpeg, expected_version):
     return out, full_version, license_name, license_file
 
 
-def ffmpeg_origin(full_version, imageio_version):
+def ffmpeg_origin(full_version, imageio_version, built_with):
+    """The Origin line and the bundled-libraries paragraph of the notices."""
+    if built_with:
+        origin = ("built from the FFmpeg source by the converter's release workflow\n"
+                  "          (%s), configured with\n"
+                  "          --disable-everything plus only the formats, filters and\n"
+                  "          encoders the converter uses" % built_with.replace("\\", "/"))
+        libraries = ("Apart from zlib (https://zlib.net/zlib_license.html; linked in\n"
+                     "statically on Windows, the system copy on macOS), the binary\n"
+                     "contains only FFmpeg's own code.")
+        return origin, libraries
     wheel = ("redistributed in the imageio-ffmpeg %s wheel "
              "(https://github.com/imageio/imageio-ffmpeg)" % imageio_version)
     if "gyan.dev" in full_version:
-        return ('static "essentials" build from https://www.gyan.dev/ffmpeg/builds/,\n'
-                "          %s" % wheel)
-    return ("static build from https://github.com/imageio/imageio-binaries,\n"
-            "          %s" % wheel)
+        origin = ('static "essentials" build from https://www.gyan.dev/ffmpeg/builds/,\n'
+                  "          %s" % wheel)
+    else:
+        origin = ("static build from https://github.com/imageio/imageio-binaries,\n"
+                  "          %s" % wheel)
+    libraries = ("The binary is statically linked with further free libraries (x264, x265,\n"
+                 "libvpx and others, listed in BUILD-INFO.txt); their source code is available\n"
+                 "from the respective projects.")
+    return origin, libraries
 
 
 def copy_pillow_license(out_dir):
@@ -146,7 +171,11 @@ def main():
     parser.add_argument("--app-version", required=True)
     parser.add_argument("--ffmpeg-source-version", required=True,
                         help="FFmpeg release whose source the Release attaches")
-    parser.add_argument("--imageio-ffmpeg-version", required=True)
+    origin = parser.add_mutually_exclusive_group(required=True)
+    origin.add_argument("--imageio-ffmpeg-version",
+                        help="the binary comes from this imageio-ffmpeg wheel")
+    origin.add_argument("--built-with", metavar="SCRIPT",
+                        help="the binary was built from source by this script")
     parser.add_argument("--release-url", required=True,
                         help="GitHub Release page the build is published on")
     parser.add_argument("--out", required=True, help="output folder (recreated)")
@@ -166,6 +195,8 @@ def main():
         fh.write(build_info)
 
     pillow_version, pillow_license = copy_pillow_license(out_dir)
+    origin, libraries = ffmpeg_origin(full_version, args.imageio_ffmpeg_version,
+                                      args.built_with)
 
     with io.open(TEMPLATE, encoding="utf-8") as fh:
         template = Template(fh.read())
@@ -175,7 +206,8 @@ def main():
         ffmpeg_version=full_version,
         ffmpeg_license=license_name,
         ffmpeg_license_file=license_file,
-        ffmpeg_origin=ffmpeg_origin(full_version, args.imageio_ffmpeg_version),
+        ffmpeg_origin=origin,
+        ffmpeg_libraries=libraries,
         ffmpeg_source_version=args.ffmpeg_source_version,
         ffmpeg_tarball="ffmpeg-%s.tar.xz" % args.ffmpeg_source_version,
         release_url=args.release_url,

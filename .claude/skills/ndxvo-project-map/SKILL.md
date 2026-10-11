@@ -24,10 +24,12 @@ ffmpeg inside. GUI text is English; the owner talks to Claude in Polish.
 | `ndxvo_converter.py` | The whole app: constants, ffmpeg helpers, probing, filter chain, preview thread, encoder thread, Tk GUI |
 | `esp32.jpg` | Photo of the device; a re-encoded copy is embedded in the script as `MOCKUP_B64` |
 | `README.md` | Run, build, release, filter-chain rationale, mockup geometry |
-| `.github/workflows/build.yml` | preflight -> macos + windows -> release |
+| `.github/workflows/build.yml` | preflight -> macos + windows (each: full, lite) -> release |
 | `.github/scripts/resolve-version.sh` | picks and validates the version (form input or tag) |
 | `.github/scripts/stamp_version.py` | rewrites the `APP_VERSION = "..."` line before packaging |
-| `.github/scripts/collect_licenses.py` | assembles the third-party license folder (GPL ffmpeg, Pillow, Python) for each build |
+| `.github/scripts/build-ffmpeg-lite.sh` | compiles the minimal LGPL ffmpeg for the `-lite` variant (component lists live here) |
+| `.github/scripts/smoke_test_ffmpeg.py` | runs the app's own probe/preview/export commands against a given ffmpeg |
+| `.github/scripts/collect_licenses.py` | assembles the third-party license folder (GPL or LGPL ffmpeg, Pillow, Python) for each build |
 | `licenses/` | notices template plus FFmpeg's license texts, copied verbatim from the source release |
 | `.github/workflows/claude.yml` | `@claude` in issues / PRs |
 | `tools/verify-ffmpeg-embedded.ps1` | local Windows proof that ffmpeg is inside the one-file exe |

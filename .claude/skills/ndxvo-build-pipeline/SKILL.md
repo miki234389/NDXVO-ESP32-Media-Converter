@@ -15,8 +15,8 @@ description: Use for anything about building and releasing the NDXVO converter -
 
 ## Job graph and version flow
 
-    preflight --+-- macos ---+
-                +-- windows -+-- release   (only if preflight.release == 'true')
+    preflight --+-- macos   (matrix: full, lite) ---+
+                +-- windows (matrix: full, lite) ---+-- release   (only if preflight.release == 'true')
 
 1. **preflight**: `resolve-version.sh` takes the form input or the tag name
    (strips the leading `v`, trims whitespace). It validates against
@@ -27,7 +27,8 @@ description: Use for anything about building and releasing the NDXVO converter -
    `APP_VERSION = "..."` line and reads it back. If the line is missing or
    reformatted, the build fails. That version appears in the title bar, the
    artifact names and (on macOS) Info.plist.
-3. **release**: runs only after both builds succeed. It pushes the tag with
+3. **release**: runs only after all four builds succeed (`fail-fast: false`, so
+   a failing variant does not cancel the other's test build). It pushes the tag with
    `GITHUB_TOKEN`, which deliberately does not start another workflow run, so
    there is no duplicate build. It then publishes with
    `softprops/action-gh-release`.
@@ -45,20 +46,52 @@ description: Use for anything about building and releasing the NDXVO converter -
 - Runs on `windows-latest`, with `--onefile --add-binary "vendor/ffmpeg.exe;."`. The separator is `;` on Windows and `:` on macOS.
 - A verify step lists the PyInstaller archive and requires `ffmpeg.exe` in it.
 
-**ffmpeg** comes from the `imageio-ffmpeg` wheel, pinned by `IMAGEIO_FFMPEG_VERSION`.
-The same pin is duplicated in `tools/verify-ffmpeg-embedded.ps1`; keep them in sync.
+**Two variants** per platform (matrix `variant`, `suffix`; job env `SUFFIX`).
+Every output and artifact name of `lite` carries `-lite`:
+- **full**: ffmpeg comes from the `imageio-ffmpeg` wheel, pinned by
+  `IMAGEIO_FFMPEG_VERSION`. The same pin is duplicated in
+  `tools/verify-ffmpeg-embedded.ps1`; keep them in sync.
+- **lite**: `.github/scripts/build-ffmpeg-lite.sh <ver> <sha> <out>` compiles
+  `FFMPEG_LITE_VERSION` (checked against `FFMPEG_LITE_SHA256`).
+  - It uses `--disable-everything` plus explicit component lists and
+    `--extra-version=ndxvo-lite`. The result is LGPL and ~9.5 MB, with no AV1.
+  - macOS builds it with clang. Windows builds it in MSYS2 MINGW64 (gcc, nasm,
+    `-static`), set up only on a cache miss.
+  - Output goes to `vendor/ffmpeg-lite/`, cached by `actions/cache` under a key
+    of version + script hash.
+  - `.gitattributes` forces LF on `*.sh`; with CRLF from the Windows checkout,
+    MSYS2 bash cannot run the script.
+  - Never `--disable-x86asm`: with inline asm still on, swscale writes garbled
+    YUV (7.1.5, gcc 15).
+  - A missing component shows up as "Option not found" or "Video: none" in
+    `ffmpeg -i`. `.mpg` needs the raw demuxers (`mpegvideo`, `h264`, ...)
+    for codec probing.
 
-**Licenses (GPL)**: both bundled ffmpeg builds are GPL (Windows GPLv3, macOS
-GPLv2+). Each build job runs `collect_licenses.py` into `vendor/licenses`
-(notices from `licenses/THIRD-PARTY-NOTICES.template.txt`, `licenses/ffmpeg/`
-texts, `ffmpeg -version`, Pillow and Python licenses). That folder is embedded
-with `--add-data`, copied into the `.dmg` as `Licenses`, and uploaded as the
-`notices-<platform>` artifact. `release` zips those artifacts into
-`...-licenses.zip`, then fetches `ffmpeg-$FFMPEG_SOURCE_VERSION.tar.xz` and
-checks `FFMPEG_SOURCE_SHA256`. It does both before tagging. The script fails on
-a version mismatch or on `--enable-nonfree`, so a bump of
-`IMAGEIO_FFMPEG_VERSION` must also update `FFMPEG_SOURCE_VERSION`, the SHA and
-`licenses/ffmpeg/`.
+Both variants then run `smoke_test_ffmpeg.py vendor/ffmpeg[.exe]`.
+- It runs the converter's own probe, preview and export commands on a generated
+  PNG, an EXIF-6 JPEG and an MJPEG AVI.
+- Every export goes through `verify_output`.
+- It checks the four-colour quadrants after the 180-degree turn, so it catches
+  garbled frames.
+- It runs locally with any ffmpeg.
+
+**Licenses**:
+- The full ffmpeg builds are GPL (Windows GPLv3, macOS GPLv2+); lite is LGPL 2.1+.
+- Each build job runs `collect_licenses.py` into `vendor/licenses`. It takes
+  `--imageio-ffmpeg-version` for full and `--built-with <script>` for lite;
+  that choice drives the Origin line and the bundled-libraries paragraph.
+- The folder holds the notices from `licenses/THIRD-PARTY-NOTICES.template.txt`,
+  the `licenses/ffmpeg/` texts, `ffmpeg -version`, and the Pillow and Python
+  licenses.
+- It is embedded with `--add-data`, copied into the `.dmg` as `Licenses`, and
+  uploaded as the `notices-<platform><suffix>` artifact.
+- Before tagging, `release` zips those artifacts into `...-licenses.zip`. It then
+  fetches both `ffmpeg-$FFMPEG_SOURCE_VERSION.tar.xz` and
+  `ffmpeg-$FFMPEG_LITE_VERSION.tar.xz` and checks their SHAs.
+- The script fails on a version mismatch or on `--enable-nonfree`. A bump of
+  `IMAGEIO_FFMPEG_VERSION` must therefore also update `FFMPEG_SOURCE_VERSION`,
+  the SHA and `licenses/ffmpeg/`. A bump of `FFMPEG_LITE_VERSION` needs its SHA,
+  taken from a signature-verified tarball.
 
 At runtime, `find_ffmpeg` searches `sys._MEIPASS` (the onefile temp dir, or
 `Contents/Frameworks` in a PyInstaller 6 `.app`), then the exe dir and
@@ -83,8 +116,8 @@ step using secrets.
 - `APP_NAME` in build.yml has to match `APP_TITLE` in the code, and the `.app`
   name used in the README's `xattr` line.
 - Action versions (`checkout@v6`, `setup-python@v6`, `upload/download-artifact@v7`,
-  `action-gh-release@v3`): look up current majors on the web before claiming
-  they are outdated.
+  `cache@v6`, `msys2/setup-msys2@v2`, `action-gh-release@v3`): look up current
+  majors on the web before claiming they are outdated.
 
 ## Local checks (safe)
 
@@ -95,6 +128,13 @@ step using secrets.
   Run it on a copy, or restore with `git checkout -- ndxvo_converter.py` afterwards.
 - **Windows packaging proof**: `powershell -ExecutionPolicy Bypass -File tools\verify-ffmpeg-embedded.ps1`.
   This is slow: it runs two PyInstaller builds.
+- **Smoke test any ffmpeg**: `python .github/scripts/smoke_test_ffmpeg.py <path-to-ffmpeg>`.
+- **Lite build locally**:
+  - Run it from an MSYS2 MINGW64 shell. The work dir is `./build/ffmpeg-lite`.
+    It has only been tried from a path without spaces, and the repo path has
+    one, so run it from a scratch dir.
+  - Use MSYS2's own `make`. The native `mingw32-make` truncates the long `ar`
+    line for libavcodec.
 
 ## Inspecting CI with gh (read-only)
 

@@ -29,6 +29,12 @@ env:
   # (the checksum is from https://ffmpeg.org/releases/, signature-verified).
   FFMPEG_SOURCE_VERSION: "7.1"
   FFMPEG_SOURCE_SHA256: "40973d44970dbc83ef302b0609f2e74982be2d85916dd2ee7472d30678a7abe6"
+  # The -lite variant bundles a minimal LGPL ffmpeg that build-ffmpeg-lite.sh
+  # compiles from this release (signature-verified checksum, as above). Its
+  # tarball is attached to every Release too. The build is cached; a change
+  # here or in the script invalidates the cache.
+  FFMPEG_LITE_VERSION: "7.1.5"
+  FFMPEG_LITE_SHA256: "de668509caf9e35e3cd162473441fdb29538c6d96ed080292b3cf9e6fc5d558f"
 
 jobs:
   # ------------------------------------------------------------ preflight ---
@@ -78,10 +84,27 @@ jobs:
           echo "Tag $TAG is free."
 
   # ---------------------------------------------------------------- macOS ---
+  # Two variants per platform, released side by side. "full" bundles the
+  # imageio-ffmpeg GPL build with every codec. "lite" bundles the minimal LGPL
+  # build from build-ffmpeg-lite.sh and carries a -lite suffix in every file and
+  # artifact name.
   macos:
-    name: macOS (Apple Silicon)
+    name: macOS (Apple Silicon, ${{ matrix.variant }})
     needs: preflight
     runs-on: macos-14          # arm64 runner
+    strategy:
+      # A failing variant must not cancel the other one's test build; release
+      # still waits for all of them.
+      fail-fast: false
+      matrix:
+        variant: [full, lite]
+        include:
+          - variant: full
+            suffix: ""
+          - variant: lite
+            suffix: "-lite"
+    env:
+      SUFFIX: ${{ matrix.suffix }}
     steps:
       - uses: actions/checkout@v6
 
@@ -96,25 +119,52 @@ jobs:
       - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pillow pyinstaller "imageio-ffmpeg==${IMAGEIO_FFMPEG_VERSION}"
+          python -m pip install pillow pyinstaller
+          if [ "${{ matrix.variant }}" = full ]; then
+            python -m pip install "imageio-ffmpeg==${IMAGEIO_FFMPEG_VERSION}"
+          fi
 
-      - name: Extract the static ffmpeg binary
+      - name: Restore the lite ffmpeg from the cache
+        id: lite-cache
+        if: matrix.variant == 'lite'
+        uses: actions/cache@v6
+        with:
+          path: vendor/ffmpeg-lite
+          key: ffmpeg-lite-macos-arm64-${{ env.FFMPEG_LITE_VERSION }}-${{ hashFiles('.github/scripts/build-ffmpeg-lite.sh') }}
+
+      - name: Build the lite ffmpeg
+        if: matrix.variant == 'lite' && steps.lite-cache.outputs.cache-hit != 'true'
+        run: bash .github/scripts/build-ffmpeg-lite.sh "$FFMPEG_LITE_VERSION" "$FFMPEG_LITE_SHA256" vendor/ffmpeg-lite/ffmpeg
+
+      - name: Stage the ffmpeg binary
         run: |
-          FF="$(python -c 'import imageio_ffmpeg, sys; sys.stdout.write(imageio_ffmpeg.get_ffmpeg_exe())')"
           mkdir -p vendor
-          cp "$FF" vendor/ffmpeg
+          if [ "${{ matrix.variant }}" = lite ]; then
+            cp vendor/ffmpeg-lite/ffmpeg vendor/ffmpeg
+          else
+            cp "$(python -c 'import imageio_ffmpeg, sys; sys.stdout.write(imageio_ffmpeg.get_ffmpeg_exe())')" vendor/ffmpeg
+          fi
           chmod +x vendor/ffmpeg
           file vendor/ffmpeg
           vendor/ffmpeg -version | head -1
 
+      - name: Smoke-test ffmpeg with the converter's own commands
+        run: python .github/scripts/smoke_test_ffmpeg.py vendor/ffmpeg
+
       - name: Collect third-party licenses
         run: |
+          if [ "${{ matrix.variant }}" = lite ]; then
+            ORIGIN=(--ffmpeg-source-version "$FFMPEG_LITE_VERSION"
+                    --built-with .github/scripts/build-ffmpeg-lite.sh)
+          else
+            ORIGIN=(--ffmpeg-source-version "$FFMPEG_SOURCE_VERSION"
+                    --imageio-ffmpeg-version "$IMAGEIO_FFMPEG_VERSION")
+          fi
           python .github/scripts/collect_licenses.py \
             --ffmpeg vendor/ffmpeg \
-            --platform "macOS arm64" \
+            --platform "macOS arm64${SUFFIX:+ lite}" \
             --app-version "${{ needs.preflight.outputs.version }}" \
-            --ffmpeg-source-version "$FFMPEG_SOURCE_VERSION" \
-            --imageio-ffmpeg-version "$IMAGEIO_FFMPEG_VERSION" \
+            "${ORIGIN[@]}" \
             --release-url "${{ github.server_url }}/${{ github.repository }}/releases/tag/v${{ needs.preflight.outputs.version }}" \
             --out vendor/licenses
 
@@ -153,7 +203,7 @@ jobs:
           cp -R vendor/licenses "dmg/Licenses"
           ln -s /Applications "dmg/Applications"
           hdiutil create -volname "$APP_NAME" -srcfolder dmg -ov -format UDZO \
-            "out/NDXVO-Media-Converter-$V-macOS-arm64.dmg"
+            "out/NDXVO-Media-Converter-$V-macOS-arm64$SUFFIX.dmg"
           ls -la out/
 
       - name: Verify ffmpeg is inside the .app inside the .dmg
@@ -161,7 +211,7 @@ jobs:
         # shipped, so a build can never be published with ffmpeg missing.
         run: |
           V="${{ needs.preflight.outputs.version }}"
-          DMG="out/NDXVO-Media-Converter-$V-macOS-arm64.dmg"
+          DMG="out/NDXVO-Media-Converter-$V-macOS-arm64$SUFFIX.dmg"
           MP="$(mktemp -d)"
           hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MP"
           FF="$MP/$APP_NAME.app/Contents/Frameworks/ffmpeg"
@@ -185,19 +235,32 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: macos-arm64-dmg-${{ needs.preflight.outputs.version }}
+          name: macos-arm64${{ matrix.suffix }}-dmg-${{ needs.preflight.outputs.version }}
           path: "out/*.dmg"
 
       - uses: actions/upload-artifact@v7
         with:
-          name: notices-macos-arm64
+          name: notices-macos-arm64${{ matrix.suffix }}
           path: vendor/licenses
 
   # -------------------------------------------------------------- Windows ---
+  # Same two variants as macOS. The lite ffmpeg is compiled in MSYS2 (gcc and
+  # nasm), which is only set up when the cache misses.
   windows:
-    name: Windows (x64)
+    name: Windows (x64, ${{ matrix.variant }})
     needs: preflight
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [full, lite]
+        include:
+          - variant: full
+            suffix: ""
+          - variant: lite
+            suffix: "-lite"
+    env:
+      SUFFIX: ${{ matrix.suffix }}
     steps:
       - uses: actions/checkout@v6
 
@@ -212,24 +275,64 @@ jobs:
       - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pillow pyinstaller "imageio-ffmpeg==$env:IMAGEIO_FFMPEG_VERSION"
+          python -m pip install pillow pyinstaller
+          if ("${{ matrix.variant }}" -eq "full") {
+            python -m pip install "imageio-ffmpeg==$env:IMAGEIO_FFMPEG_VERSION"
+          }
 
-      - name: Extract the static ffmpeg binary
+      - name: Restore the lite ffmpeg from the cache
+        id: lite-cache
+        if: matrix.variant == 'lite'
+        uses: actions/cache@v6
+        with:
+          path: vendor/ffmpeg-lite
+          key: ffmpeg-lite-windows-x64-${{ env.FFMPEG_LITE_VERSION }}-${{ hashFiles('.github/scripts/build-ffmpeg-lite.sh') }}
+
+      - name: Set up MSYS2 for the lite ffmpeg build
+        if: matrix.variant == 'lite' && steps.lite-cache.outputs.cache-hit != 'true'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            make diffutils curl tar xz
+            mingw-w64-x86_64-gcc mingw-w64-x86_64-nasm
+            mingw-w64-x86_64-pkgconf mingw-w64-x86_64-zlib
+
+      - name: Build the lite ffmpeg
+        if: matrix.variant == 'lite' && steps.lite-cache.outputs.cache-hit != 'true'
+        shell: msys2 {0}
+        run: bash .github/scripts/build-ffmpeg-lite.sh "$FFMPEG_LITE_VERSION" "$FFMPEG_LITE_SHA256" vendor/ffmpeg-lite/ffmpeg.exe
+
+      - name: Stage the ffmpeg binary
         run: |
-          $ff = python -c "import imageio_ffmpeg, sys; sys.stdout.write(imageio_ffmpeg.get_ffmpeg_exe())"
           New-Item -ItemType Directory -Force -Path vendor | Out-Null
-          Copy-Item $ff vendor\ffmpeg.exe
+          if ("${{ matrix.variant }}" -eq "lite") {
+            Copy-Item vendor\ffmpeg-lite\ffmpeg.exe vendor\ffmpeg.exe
+          } else {
+            $ff = python -c "import imageio_ffmpeg, sys; sys.stdout.write(imageio_ffmpeg.get_ffmpeg_exe())"
+            Copy-Item $ff vendor\ffmpeg.exe
+          }
           .\vendor\ffmpeg.exe -version | Select-Object -First 1
+
+      - name: Smoke-test ffmpeg with the converter's own commands
+        run: python .github/scripts/smoke_test_ffmpeg.py vendor/ffmpeg.exe
 
       - name: Collect third-party licenses
         shell: bash
         run: |
+          if [ "${{ matrix.variant }}" = lite ]; then
+            ORIGIN=(--ffmpeg-source-version "$FFMPEG_LITE_VERSION"
+                    --built-with .github/scripts/build-ffmpeg-lite.sh)
+          else
+            ORIGIN=(--ffmpeg-source-version "$FFMPEG_SOURCE_VERSION"
+                    --imageio-ffmpeg-version "$IMAGEIO_FFMPEG_VERSION")
+          fi
           python .github/scripts/collect_licenses.py \
             --ffmpeg vendor/ffmpeg.exe \
-            --platform "Windows x64" \
+            --platform "Windows x64${SUFFIX:+ lite}" \
             --app-version "${{ needs.preflight.outputs.version }}" \
-            --ffmpeg-source-version "$FFMPEG_SOURCE_VERSION" \
-            --imageio-ffmpeg-version "$IMAGEIO_FFMPEG_VERSION" \
+            "${ORIGIN[@]}" \
             --release-url "${{ github.server_url }}/${{ github.repository }}/releases/tag/v${{ needs.preflight.outputs.version }}" \
             --out vendor/licenses
 
@@ -247,7 +350,7 @@ jobs:
         run: |
           mkdir -p out
           mv "dist/$APP_NAME.exe" \
-             "out/NDXVO-Media-Converter-${{ needs.preflight.outputs.version }}-Windows-x64.exe"
+             "out/NDXVO-Media-Converter-${{ needs.preflight.outputs.version }}-Windows-x64$SUFFIX.exe"
           ls -la out/
 
       - name: Verify ffmpeg is inside the .exe
@@ -255,7 +358,7 @@ jobs:
         # asserts ffmpeg.exe is one of its entries.
         shell: bash
         run: |
-          EXE="out/NDXVO-Media-Converter-${{ needs.preflight.outputs.version }}-Windows-x64.exe"
+          EXE="out/NDXVO-Media-Converter-${{ needs.preflight.outputs.version }}-Windows-x64$SUFFIX.exe"
           ls -l "$EXE"
           LISTING="$(python -m PyInstaller.utils.cliutils.archive_viewer --list --brief "$EXE" | tr ',' '\n')"
           echo "$LISTING" | grep -qi 'ffmpeg\.exe' \
@@ -267,17 +370,17 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: windows-x64-exe-${{ needs.preflight.outputs.version }}
+          name: windows-x64${{ matrix.suffix }}-exe-${{ needs.preflight.outputs.version }}
           path: "out/*.exe"
 
       - uses: actions/upload-artifact@v7
         with:
-          name: notices-windows-x64
+          name: notices-windows-x64${{ matrix.suffix }}
           path: vendor/licenses
 
   # -------------------------------------------------------------- release ---
-  # Runs only after BOTH builds succeed, so a tag is never created for a version
-  # that failed to build on one of the platforms.
+  # Runs only after EVERY build succeeds (both platforms, both variants), so a
+  # tag is never created for a version that failed to build anywhere.
   release:
     name: Tag and publish
     needs: [preflight, macos, windows]
@@ -304,18 +407,25 @@ jobs:
           path: notices
 
       - name: Attach the license notices and the FFmpeg source
-        # The bundled ffmpeg is GPL: its license texts and its source code have
-        # to be offered from the same place as the binaries. This runs before
-        # the tag is created, so a failed download never leaves a tag behind.
+        # The bundled ffmpeg builds are GPL (full) and LGPL (lite): their
+        # license texts and source code have to be offered from the same place
+        # as the binaries. This runs before the tag is created, so a failed
+        # download never leaves a tag behind.
         run: |
           V="${{ needs.preflight.outputs.version }}"
           cd notices
           for d in notices-*; do mv "$d" "${d#notices-}"; done
           zip -qr "../assets/NDXVO-Media-Converter-$V-licenses.zip" .
           cd ..
-          TARBALL="ffmpeg-$FFMPEG_SOURCE_VERSION.tar.xz"
-          curl -fsSL --retry 3 -o "assets/$TARBALL" "https://ffmpeg.org/releases/$TARBALL"
-          echo "$FFMPEG_SOURCE_SHA256  assets/$TARBALL" | sha256sum -c -
+          fetch_source() {
+            TARBALL="ffmpeg-$1.tar.xz"
+            curl -fsSL --retry 3 -o "assets/$TARBALL" "https://ffmpeg.org/releases/$TARBALL"
+            echo "$2  assets/$TARBALL" | sha256sum -c -
+          }
+          fetch_source "$FFMPEG_SOURCE_VERSION" "$FFMPEG_SOURCE_SHA256"
+          if [ "$FFMPEG_LITE_VERSION" != "$FFMPEG_SOURCE_VERSION" ]; then
+            fetch_source "$FFMPEG_LITE_VERSION" "$FFMPEG_LITE_SHA256"
+          fi
 
       - name: Show what will be published
         run: ls -la assets
@@ -339,7 +449,12 @@ jobs:
           files: assets/*
           fail_on_unmatched_files: true
           body: |
-            Both builds bundle FFmpeg ${{ env.FFMPEG_SOURCE_VERSION }}, which is licensed under the GPL. The converter runs it as a separate program.
+            Each platform comes in two variants that work the same and differ only in the bundled FFmpeg:
+
+            - **Standard** (`…-Windows-x64.exe`, `…-macOS-arm64.dmg`): FFmpeg ${{ env.FFMPEG_SOURCE_VERSION }} with every codec, licensed under the GPL.
+            - **Lite** (`…-lite.exe`, `…-lite.dmg`): a much smaller FFmpeg ${{ env.FFMPEG_LITE_VERSION }} build, licensed under the LGPL. It opens MP4, MOV, MKV, WebM, AVI, MPG, TS, WMV, FLV and OGV with H.264, HEVC, VP8, VP9, MPEG-1/2/4, WMV, ProRes or Theora video, plus JPG, PNG, BMP, GIF, WebP and TIFF images. It does not open AV1 video.
+
+            Either variant runs FFmpeg as a separate program and can be pointed at another ffmpeg from the ffmpeg row in the app.
 
             - License texts and build details: `NDXVO-Media-Converter-${{ needs.preflight.outputs.version }}-licenses.zip` (on macOS also in the `Licenses` folder of the .dmg)
-            - FFmpeg source code: `ffmpeg-${{ env.FFMPEG_SOURCE_VERSION }}.tar.xz`
+            - FFmpeg source code: `ffmpeg-${{ env.FFMPEG_SOURCE_VERSION }}.tar.xz` (standard) and `ffmpeg-${{ env.FFMPEG_LITE_VERSION }}.tar.xz` (lite)

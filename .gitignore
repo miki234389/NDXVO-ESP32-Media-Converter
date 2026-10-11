@@ -3,8 +3,9 @@ build/
 dist/
 *.spec
 
-# Static ffmpeg extracted from the imageio-ffmpeg wheel by the build workflow
-# and by tools/verify-ffmpeg-embedded.ps1 - ~50-90 MB, never committed.
+# Static ffmpeg extracted from the imageio-ffmpeg wheel (~50-90 MB) or built by
+# build-ffmpeg-lite.sh (vendor/ffmpeg-lite/), staged by the build workflow and
+# by tools/verify-ffmpeg-embedded.ps1 - never committed.
 vendor/
 
 # Packaging scratch (macOS .dmg staging, collected artifacts)

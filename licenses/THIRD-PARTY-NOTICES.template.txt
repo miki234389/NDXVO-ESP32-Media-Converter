@@ -18,8 +18,8 @@ Origin:   ${ffmpeg_origin}
 
 FFmpeg is a separate program. NDXVO Media Converter starts it as an external
 process and does not link against it, so the converter's own code is not
-covered by the GPL. The bundled copy can be replaced with any other ffmpeg
-build from the ffmpeg row in the app.
+covered by FFmpeg's license. The bundled copy can be replaced with any other
+ffmpeg build from the ffmpeg row in the app.
 
 Source code: the binary was built from the FFmpeg ${ffmpeg_source_version} release. That
 source code is attached to the GitHub Release this application is published
@@ -31,9 +31,7 @@ It is also available from the FFmpeg project:
 
     https://ffmpeg.org/releases/${ffmpeg_tarball}
 
-The binary is statically linked with further free libraries (x264, x265,
-libvpx and others, listed in BUILD-INFO.txt); their source code is available
-from the respective projects.
+${ffmpeg_libraries}
 
 
 Pillow ${pillow_version}

@@ -110,7 +110,7 @@ this while iterating.
 
 **Release from the button** — same form, but tick `release`. On success the
 workflow tags the built commit as `v<version>` and publishes a GitHub Release
-with both binaries attached. This is the normal way to cut a release: one field
+with all four binaries attached. This is the normal way to cut a release: one field
 and one checkbox, no local tagging.
 
 **Release from a tag** — push `v1.2.0` yourself and the same thing happens, with
@@ -129,17 +129,19 @@ mistaken for a release.
 ### Job layout
 
 ```
-preflight ──┬── macos ───┐
-            └── windows ─┴── release   (only if this run publishes)
+preflight ──┬── macos   (full, lite) ───┐
+            └── windows (full, lite) ───┴── release   (only if this run publishes)
 ```
 
-`preflight` resolves and validates the version once and hands it to both build
-jobs, so the two binaries can never disagree about what they are. When the run
+`preflight` resolves and validates the version once and hands it to every build
+job, so the binaries can never disagree about what they are. When the run
 is going to publish, it also checks up front that the tag is still free — that
 failure arrives in seconds rather than after a full build.
 
-`release` runs only after **both** builds succeed, so a tag never points at a
-version that failed to build on one platform.
+`macos` and `windows` each run twice, once per [variant](#standard-and-lite-variants).
+A failing variant does not cancel the other, so a test build still yields
+whatever did build. `release` runs only after **all four** builds succeed, so a
+tag never points at a version that failed to build anywhere.
 
 The tag is pushed with `GITHUB_TOKEN`, and GitHub deliberately does not start new
 workflow runs for such pushes. That is what stops the tag-push trigger from
@@ -147,15 +149,19 @@ firing a second, duplicate build.
 
 | Target | Runner | Output |
 |---|---|---|
-| macOS, Apple Silicon | `macos-14` (arm64) | `NDXVO-Media-Converter-<version>-macOS-arm64.dmg` |
-| Windows x64 | `windows-latest` | `NDXVO-Media-Converter-<version>-Windows-x64.exe` |
+| macOS, Apple Silicon | `macos-14` (arm64) | `NDXVO-Media-Converter-<version>-macOS-arm64.dmg`, `…-macOS-arm64-lite.dmg` |
+| Windows x64 | `windows-latest` | `NDXVO-Media-Converter-<version>-Windows-x64.exe`, `…-Windows-x64-lite.exe` |
 
-Each target bundles a static ffmpeg, so end users install nothing. ffmpeg is
+Each binary bundles a static ffmpeg, so end users install nothing. ffmpeg is
 staged into `vendor/` and finished binaries into `out/`, so the upload globs
-cannot pick up build inputs by accident.
+cannot pick up build inputs by accident. Before packaging, every job runs
+`.github/scripts/smoke_test_ffmpeg.py` on the staged ffmpeg: it pushes a
+generated PNG, an EXIF-rotated JPEG and an MJPEG AVI through the converter's own
+probe, preview and export commands, checks each output with `verify_output`, and
+checks that the colours land where they should.
 
-Besides the two binaries, every Release carries
-`NDXVO-Media-Converter-<version>-licenses.zip` and the FFmpeg source tarball —
+Besides the four binaries, every Release carries
+`NDXVO-Media-Converter-<version>-licenses.zip` and the FFmpeg source tarballs —
 see [Licenses](#licenses).
 
 Artifacts are uploaded with `archive: false`, so the download is the `.dmg` or
@@ -165,6 +171,44 @@ step fails rather than silently re-zipping.
 
 Artifacts on a test build are kept for 90 days and need a GitHub login to
 download. Release assets are permanent and directly linkable.
+
+### Standard and lite variants
+
+Both variants run the same app; only the bundled ffmpeg differs. The app has the
+same name in both, so on a Mac one replaces the other in `/Applications`.
+
+| | Standard | Lite |
+|---|---|---|
+| ffmpeg | imageio-ffmpeg build of FFmpeg 7.1, every codec | FFmpeg 7.1.5 built by `.github/scripts/build-ffmpeg-lite.sh` |
+| ffmpeg size (Windows) | 87.6 MB (31 MB compressed) | 9.5 MB (3.6 MB compressed) |
+| License | GPL | LGPL 2.1 or later |
+| Opens | anything ffmpeg reads | see below; no AV1 |
+
+The lite build is configured with `--disable-everything`, and only what the
+converter uses is switched back on:
+- **Containers**: MP4, MOV, MKV, WebM, AVI, MPG, TS, WMV, FLV and OGV.
+- **Video**: H.264, HEVC (10-bit too), VP8, VP9, MPEG-1, MPEG-2, MPEG-4, WMV,
+  ProRes, Theora and MJPEG.
+- **Images**: JPG, PNG, BMP, GIF, WebP and TIFF.
+- **Output**: the MJPEG and PNG encoders, the AVI and image muxers, and the
+  filters `build_vf` emits.
+- **Audio**: common decoders only, so that `ffmpeg -i` does not stall on audio
+  streams. Audio is never encoded.
+
+AV1 is left out on purpose, because it needs libdav1d. A lite user who meets an
+unsupported file can pick a full ffmpeg in the ffmpeg row.
+
+The script is run on the macOS runner (Xcode clang) and in MSYS2 on the Windows
+runner (gcc and nasm, fully static). It downloads `ffmpeg-<FFMPEG_LITE_VERSION>.tar.xz`
+and checks it against `FFMPEG_LITE_SHA256`. The result is cached under a key
+built from that version and a hash of the script. Edit either one and the next
+run rebuilds; otherwise the lite jobs skip the compile. To support another
+format, add its demuxer, decoder or parser to the lists in the script, and give
+the smoke test a sample when it is something the test does not cover yet.
+
+Never build it with `--disable-x86asm`. With inline asm still on, swscale wrote
+garbled YUV frames that `verify_output` cannot detect (the smoke test's colour
+check does).
 
 ### First launch on macOS
 
@@ -185,11 +229,13 @@ secrets — no restructuring required.
 
 ### Licenses
 
-The bundled ffmpeg is a GPL build: GPLv3 on Windows (the gyan.dev "essentials"
-build), GPLv2-or-later on macOS, both taken from the pinned imageio-ffmpeg
-wheel. The converter only starts it as a separate process, so its own code is
-not covered by the GPL — but every binary handed to someone must come with the
-GPL text and the ffmpeg source code. The build takes care of that:
+The standard variant bundles a GPL ffmpeg: GPLv3 on Windows (the gyan.dev
+"essentials" build), GPLv2-or-later on macOS, both taken from the pinned
+imageio-ffmpeg wheel. The lite variant bundles an LGPL-2.1-or-later ffmpeg built
+from source. The converter only starts ffmpeg as a separate process, so its own
+code is not covered by either license — but every binary handed to someone must
+come with the license text and the ffmpeg source code. The build takes care of
+that:
 
 - `.github/scripts/collect_licenses.py` assembles one folder:
   `THIRD-PARTY-NOTICES.txt` (rendered from
@@ -197,18 +243,23 @@ GPL text and the ffmpeg source code. The build takes care of that:
   (`licenses/ffmpeg/`, copied verbatim from the FFmpeg 7.1 source release), the
   bundled binary's full `ffmpeg -version` output, and the Pillow and Python
   licenses.
-- That folder is embedded in both apps and copied into the `.dmg` as `Licenses`.
-- The `release` job zips the folders from both platforms into
-  `NDXVO-Media-Converter-<version>-licenses.zip`, downloads
-  `ffmpeg-<FFMPEG_SOURCE_VERSION>.tar.xz` from ffmpeg.org, checks it against
-  `FFMPEG_SOURCE_SHA256` and attaches both to the Release, before the tag is
-  created.
+- That folder is embedded in every app and copied into each `.dmg` as `Licenses`.
+- The `release` job zips the folders from all four builds into
+  `NDXVO-Media-Converter-<version>-licenses.zip`. It downloads
+  `ffmpeg-<FFMPEG_SOURCE_VERSION>.tar.xz` and `ffmpeg-<FFMPEG_LITE_VERSION>.tar.xz`
+  from ffmpeg.org and checks each against its `…_SHA256`. It attaches all of
+  them to the Release before the tag is created.
 
-The build fails if the bundled ffmpeg is not the release named in
-`FFMPEG_SOURCE_VERSION`, or if it was built with `--enable-nonfree` (such a
-build may not be redistributed at all). When you bump `IMAGEIO_FFMPEG_VERSION`,
-update `FFMPEG_SOURCE_VERSION` and `FFMPEG_SOURCE_SHA256` with it, and refresh
-`licenses/ffmpeg/` from the new source tarball.
+The build fails if a bundled ffmpeg is not the release named in
+`FFMPEG_SOURCE_VERSION` (standard) or `FFMPEG_LITE_VERSION` (lite). It also
+fails if ffmpeg was built with `--enable-nonfree`, because such a build may not
+be redistributed at all.
+
+When you bump `IMAGEIO_FFMPEG_VERSION`, update `FFMPEG_SOURCE_VERSION` and
+`FFMPEG_SOURCE_SHA256` with it. When you bump `FFMPEG_LITE_VERSION`, update
+`FFMPEG_LITE_SHA256`. Take the checksum from ffmpeg.org after verifying the
+tarball's `.asc` signature. In both cases, refresh `licenses/ffmpeg/` if the new
+source tarball's license files differ.
 
 ---
 
