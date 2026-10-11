@@ -19,20 +19,23 @@ README in full (it is short); pull code with
 | Feature list | Controls built in `App._build_controls`: Fit mode, Crop X/Y, Centre crop, Rotation, Mirror H/V, Format (AVI / JPG), FPS, Quality, Sharpen, Pad colour, Video duration, Reset to defaults |
 | "FPS (30 / 25)", "Python 3.9+", "Pillow" | `FPS_CHOICES`, module docstring, third-party imports |
 | ffmpeg lookup order | `find_ffmpeg` |
-| Build section: runners, artifact names, `archive: false`, retention, job layout | `.github/workflows/build.yml` |
+| Build section: runners, artifact names, zipped run-page artifacts vs plain Release assets, retention, job layout | `.github/workflows/build.yml` |
+| "Standard and lite variants": contents, sizes, compile times | Component lists in `.github/scripts/build-ffmpeg-lite.sh`; sizes from the latest Release assets |
+| Licenses section | `collect_licenses.py`, `licenses/ffmpeg/`, `licenses/mingw-w64/`, the `FFMPEG_*` env in build.yml |
+| Filter-chain order line | `build_vf` |
 | Mockup constants code block | `MOCKUP_SCREEN`, `MOCKUP_CROP`, `CORNER_RADIUS_RATIO` |
 | Every file path mentioned | Exists in the repo |
 | Filter-chain explanation | `build_vf` / `scaled_size` (see ndxvo-filter-chain) |
 
-## Known drift found on 2026-10-11 (re-verify; may be fixed since)
+## Drift fixed on 2026-10-11 (watch for regressions)
 
-- **`MOCKUP_SCREEN`**: the README says `(297, 227, 207, 385)`; the code says `(294, ...)`.
-- **Undocumented settings.** Sharpen, the 1-10
-  Quality dial (vs ffmpeg `-q:v`), and the frame-budget check and warning after
-  Generate are not described in the README.
-- **`archive: false`.** The README says artifacts upload with `archive: false`,
-  but neither `upload-artifact` step in build.yml sets it. Either add it, or
-  correct the README (downloads would then be zipped).
+- **`MOCKUP_SCREEN`**: the README had `297`; it is `294` since commit 178bfb4.
+- **Undocumented settings**: Sharpen and the 1-10 Quality dial are now in the
+  feature list.
+- **`archive: false`**: build.yml has not set it since commit 0590004. The
+  README now says that run-page artifacts are zips and that Release assets are
+  plain files.
+- **Filter order**: the order line now includes EXIF orientation and `unsharp`.
 
 ## Intentional differences (do not flag)
 

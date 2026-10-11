@@ -46,7 +46,12 @@ ffmpeg -y -noautorotate -i photo.jpg -frames:v 1 -pix_fmt yuvj420p -c:v mjpeg -q
 - The exact ffmpeg command is always shown and can be copied.
 - Output resolution is locked to 172 × 320, as MJPEG/AVI or baseline JPEG, so you
   cannot accidentally produce a file the device will not show. FPS (30 / 25, AVI
-  only) and JPEG quality remain adjustable.
+  only) and quality remain adjustable.
+- **Quality** is a 1–10 dial, where higher is better. Level 9 is the reference
+  command's `-q:v 2`, and 10 is `-q:v 1`.
+- **Sharpen** (off to 1.5) runs a 3×3 unsharp mask on the luma after the
+  downscale, so its strength means the same for any source size. Chroma is left
+  alone, because sharpening it only adds bytes.
 - Colour is fixed at 4:2:0 (`yuvj420p`). The device's decoder (JPEGDEC) reads
   the MCU layout from the luma channel alone and assumes the colour channels are
   1×1; ffmpeg writes 4:2:2 as Y 2×2 / Cb,Cr 1×2 and 4:4:4 as 1×2 throughout, so
@@ -164,10 +169,11 @@ Besides the four binaries, every Release carries
 `NDXVO-Media-Converter-<version>-licenses.zip` and the FFmpeg source tarballs —
 see [Licenses](#licenses).
 
-Artifacts are uploaded with `archive: false`, so the download is the `.dmg` or
-`.exe` itself rather than a zip wrapping it. This works because each job
-produces exactly one file — if a build ever emits more than one, the upload
-step fails rather than silently re-zipping.
+On the run page, `upload-artifact` stores each binary as a zip (its `archive`
+option is left at the default), so a test build downloads as
+`windows-x64-lite-exe-<version>.zip` and so on. The `release` job unpacks those
+zips, so every `.dmg` and `.exe` is attached to the Release as the file itself.
+The only zip on a Release is `…-licenses.zip`.
 
 Artifacts on a test build are kept for 90 days and need a GitHub login to
 download. Release assets are permanent and directly linkable.
@@ -180,7 +186,8 @@ same name in both, so on a Mac one replaces the other in `/Applications`.
 | | Standard | Lite |
 |---|---|---|
 | ffmpeg | imageio-ffmpeg build of FFmpeg 7.1, every codec | FFmpeg 7.1.5 built by `.github/scripts/build-ffmpeg-lite.sh` |
-| ffmpeg size (Windows) | 87.6 MB (31 MB compressed) | 9.5 MB (3.6 MB compressed) |
+| ffmpeg binary | Windows 87.6 MB, macOS 49.4 MB | Windows 9.5 MB, macOS 7.7 MB |
+| Download (v2.0.1) | `.exe` 50.8 MB, `.dmg` 40.8 MB | `.exe` 23.3 MB, `.dmg` 22.3 MB |
 | License | GPL | LGPL 2.1 or later |
 | Opens | anything ffmpeg reads | see below; no AV1 |
 
@@ -198,11 +205,18 @@ converter uses is switched back on:
 AV1 is left out on purpose, because it needs libdav1d. A lite user who meets an
 unsupported file can pick a full ffmpeg in the ffmpeg row.
 
-The script is run on the macOS runner (Xcode clang) and in MSYS2 on the Windows
-runner (gcc and nasm, fully static). It downloads `ffmpeg-<FFMPEG_LITE_VERSION>.tar.xz`
-and checks it against `FFMPEG_LITE_SHA256`. The result is cached under a key
-built from that version and a hash of the script. Edit either one and the next
-run rebuilds; otherwise the lite jobs skip the compile. To support another
+The script runs on both runners:
+- **macOS**: Xcode clang.
+- **Windows**: MSYS2's UCRT64 environment, with gcc and nasm. Everything is
+  linked statically except Windows' own DLLs; the Universal C Runtime that the
+  bundled Python needs anyway is one of those.
+
+It downloads `ffmpeg-<FFMPEG_LITE_VERSION>.tar.xz` and checks it against
+`FFMPEG_LITE_SHA256`. The result is cached under a key built from that version,
+a hash of the script and, on Windows, the MSYS2 environment (`LITE_MSYSTEM` in
+the `windows` job). Change any of them and the next run rebuilds; otherwise the
+lite jobs skip the compile. A compile takes about
+1.5 minutes on macOS and 4 minutes on Windows, MSYS2 setup included. To support another
 format, add its demuxer, decoder or parser to the lists in the script, and give
 the smoke test a sample when it is something the test does not cover yet.
 
@@ -238,11 +252,18 @@ come with the license text and the ffmpeg source code. The build takes care of
 that:
 
 - `.github/scripts/collect_licenses.py` assembles one folder:
-  `THIRD-PARTY-NOTICES.txt` (rendered from
-  `licenses/THIRD-PARTY-NOTICES.template.txt`), FFmpeg's own license files
-  (`licenses/ffmpeg/`, copied verbatim from the FFmpeg 7.1 source release), the
-  bundled binary's full `ffmpeg -version` output, and the Pillow and Python
-  licenses.
+  - `THIRD-PARTY-NOTICES.txt`, rendered from
+    `licenses/THIRD-PARTY-NOTICES.template.txt`.
+  - FFmpeg's own license files from `licenses/ffmpeg/`, copied verbatim from the
+    FFmpeg 7.1 source release. The 7.1.5 release ships the same texts; only its
+    `COPYING.LGPLv2.1` drops the form-feed page breaks.
+  - On Windows only, the MinGW-w64 runtime and winpthreads notices from
+    `licenses/mingw-w64/`. Both Windows ffmpeg builds are compiled with
+    MinGW-w64, which links parts of those libraries into the exe. The texts come
+    from MSYS2's `crt` and `winpthreads` packages, version 14.0.0, and are the
+    same in the MINGW64 and UCRT64 builds.
+  - The bundled binary's full `ffmpeg -version` output.
+  - The Pillow and Python licenses.
 - That folder is embedded in every app and copied into each `.dmg` as `Licenses`.
 - The `release` job zips the folders from all four builds into
   `NDXVO-Media-Converter-<version>-licenses.zip`. It downloads
@@ -259,7 +280,8 @@ When you bump `IMAGEIO_FFMPEG_VERSION`, update `FFMPEG_SOURCE_VERSION` and
 `FFMPEG_SOURCE_SHA256` with it. When you bump `FFMPEG_LITE_VERSION`, update
 `FFMPEG_LITE_SHA256`. Take the checksum from ffmpeg.org after verifying the
 tarball's `.asc` signature. In both cases, refresh `licenses/ffmpeg/` if the new
-source tarball's license files differ.
+source tarball's license files differ. If MSYS2 ever changes the license files of
+its `crt` or `winpthreads` packages, copy them into `licenses/mingw-w64/`.
 
 ---
 
@@ -287,7 +309,9 @@ are rejected, so a bot cannot put Claude into a loop.
 
 ## How the filter chain is built
 
-Order: `fps` → `scale` → `crop`/`pad` → rotation and mirroring.
+Order: EXIF orientation (stills only) → `fps` (video saved as AVI only) →
+`scale` → `crop`/`pad` → `unsharp` (only when Sharpen is on) → rotation and
+mirroring.
 
 Orientation filters are placed **last** whenever they preserve the frame's
 aspect ratio (rotation 0° or 180°), because lanczos resampling before a flip and
@@ -313,7 +337,7 @@ The panel photo is embedded in the script as base64. Two constants near the top
 control where the preview is pasted:
 
 ```python
-MOCKUP_SCREEN       = (297, 227, 207, 385)   # x, y, w, h of the active LCD area
+MOCKUP_SCREEN       = (294, 227, 207, 385)   # x, y, w, h of the active LCD area
 MOCKUP_CROP         = (255, 165, 545, 635)   # visible region of the photo
 CORNER_RADIUS_RATIO = 0.086                  # of the screen width
 ```

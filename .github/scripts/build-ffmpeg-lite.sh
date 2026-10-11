@@ -10,8 +10,8 @@
 #
 # usage: bash .github/scripts/build-ffmpeg-lite.sh <version> <sha256> <output>
 #
-# Runs on macOS (Xcode clang) and in an MSYS2 MINGW64 shell on Windows (gcc,
-# nasm, make, zlib). Work files go to build/ffmpeg-lite under the current
+# Runs on macOS (Xcode clang) and in an MSYS2 UCRT64 shell on Windows (gcc,
+# nasm, make, zlib; MINGW64 works too). Work files go to build/ffmpeg-lite under the current
 # directory. build.yml caches <output> under a key that hashes this file, so
 # any edit here forces a rebuild.
 set -euo pipefail
@@ -65,9 +65,13 @@ case "$(uname -s)" in
                     --extra-ldflags=-mmacosx-version-min=11.0)
     JOBS="$(sysctl -n hw.ncpu)"
     ;;
-  MINGW*|MSYS*)
-    # -static keeps libgcc, winpthread and zlib inside the exe: it needs no
-    # DLLs beyond the ones every Windows has.  Do not add --disable-x86asm:
+  UCRT64*|MINGW64*)
+    # uname reports the MSYS2 environment (UCRT64_NT-..., MINGW64_NT-...); the
+    # plain MSYS shell is not a target, since it links against msys-2.0.dll.
+    # -static keeps libgcc, winpthreads and zlib inside the exe.  The only DLLs
+    # left are Windows' own, the Universal C Runtime included (built into
+    # Windows 10 and later, and needed by the bundled Python anyway).
+    # Do not add --disable-x86asm:
     # with inline asm still on, swscale's YUV output came out garbled (7.1.5,
     # gcc 15).  Without nasm, configure stops, which is the right outcome.
     PLATFORM_FLAGS=(--enable-w32threads --extra-ldflags=-static)

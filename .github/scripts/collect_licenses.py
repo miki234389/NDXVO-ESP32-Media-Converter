@@ -10,6 +10,8 @@ the app, copies into the .dmg and attaches to the GitHub Release:
     <out>/THIRD-PARTY-NOTICES.txt   rendered from licenses/THIRD-PARTY-NOTICES.template.txt
     <out>/ffmpeg/                   FFmpeg's own LICENSE.md and COPYING.* files,
                                     plus BUILD-INFO.txt ("ffmpeg -version" output)
+    <out>/mingw-w64/                MinGW-w64 runtime and winpthreads notices, for a
+                                    Windows ffmpeg (both builds use MinGW-w64)
     <out>/Pillow/LICENSE.txt        from the installed Pillow wheel
     <out>/Python/LICENSE.txt        from the running interpreter, if present
 
@@ -47,6 +49,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 LICENSES_DIR = os.path.join(ROOT, "licenses")
 TEMPLATE = os.path.join(LICENSES_DIR, "THIRD-PARTY-NOTICES.template.txt")
 FFMPEG_TEXTS = os.path.join(LICENSES_DIR, "ffmpeg")
+MINGW_TEXTS = os.path.join(LICENSES_DIR, "mingw-w64")
 
 
 def warn(message):
@@ -94,16 +97,24 @@ def ffmpeg_info(ffmpeg, expected_version):
     return out, full_version, license_name, license_file
 
 
-def ffmpeg_origin(full_version, imageio_version, built_with):
+MINGW_NOTE = ("Like every program built with MinGW-w64, the Windows binary also contains\n"
+              "parts of the MinGW-w64 runtime and of winpthreads; their copyright notices\n"
+              "are in mingw-w64/.")
+
+
+def ffmpeg_origin(full_version, imageio_version, built_with, windows):
     """The Origin line and the bundled-libraries paragraph of the notices."""
     if built_with:
         origin = ("built from the FFmpeg source by the converter's release workflow\n"
                   "          (%s), configured with\n"
                   "          --disable-everything plus only the formats, filters and\n"
                   "          encoders the converter uses" % built_with.replace("\\", "/"))
-        libraries = ("Apart from zlib (https://zlib.net/zlib_license.html; linked in\n"
-                     "statically on Windows, the system copy on macOS), the binary\n"
-                     "contains only FFmpeg's own code.")
+        if windows:
+            libraries = ("Apart from zlib (https://zlib.net/zlib_license.html, linked in\n"
+                         "statically), the binary contains only FFmpeg's own code.\n\n" + MINGW_NOTE)
+        else:
+            libraries = ("Apart from zlib, which it takes from macOS, the binary contains only\n"
+                         "FFmpeg's own code.")
         return origin, libraries
     wheel = ("redistributed in the imageio-ffmpeg %s wheel "
              "(https://github.com/imageio/imageio-ffmpeg)" % imageio_version)
@@ -116,6 +127,8 @@ def ffmpeg_origin(full_version, imageio_version, built_with):
     libraries = ("The binary is statically linked with further free libraries (x264, x265,\n"
                  "libvpx and others, listed in BUILD-INFO.txt); their source code is available\n"
                  "from the respective projects.")
+    if windows:
+        libraries += "\n\n" + MINGW_NOTE
     return origin, libraries
 
 
@@ -193,10 +206,16 @@ def main():
     shutil.copytree(FFMPEG_TEXTS, os.path.join(out_dir, "ffmpeg"))
     with io.open(os.path.join(out_dir, "ffmpeg", "BUILD-INFO.txt"), "w", encoding="utf-8") as fh:
         fh.write(build_info)
+    # Every Windows ffmpeg used here (gyan.dev's and the lite build) is built
+    # with MinGW-w64, which links parts of its runtime and winpthreads into the
+    # exe; their licenses ask for the notices to travel with the binary.
+    windows = args.ffmpeg.lower().endswith(".exe")
+    if windows:
+        shutil.copytree(MINGW_TEXTS, os.path.join(out_dir, "mingw-w64"))
 
     pillow_version, pillow_license = copy_pillow_license(out_dir)
     origin, libraries = ffmpeg_origin(full_version, args.imageio_ffmpeg_version,
-                                      args.built_with)
+                                      args.built_with, windows)
 
     with io.open(TEMPLATE, encoding="utf-8") as fh:
         template = Template(fh.read())

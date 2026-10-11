@@ -31,7 +31,9 @@ description: Use for anything about building and releasing the NDXVO converter -
    a failing variant does not cancel the other's test build). It pushes the tag with
    `GITHUB_TOKEN`, which deliberately does not start another workflow run, so
    there is no duplicate build. It then publishes with
-   `softprops/action-gh-release`.
+   `softprops/action-gh-release`. Run-page artifacts are zips, because
+   `upload-artifact` keeps its default `archive: true`. Release assets are the
+   plain `.exe` / `.dmg` files, because `download-artifact` unpacks them.
 
 ## Per platform
 
@@ -55,10 +57,13 @@ Every output and artifact name of `lite` carries `-lite`:
   `FFMPEG_LITE_VERSION` (checked against `FFMPEG_LITE_SHA256`).
   - It uses `--disable-everything` plus explicit component lists and
     `--extra-version=ndxvo-lite`. The result is LGPL and ~9.5 MB, with no AV1.
-  - macOS builds it with clang. Windows builds it in MSYS2 MINGW64 (gcc, nasm,
-    `-static`), set up only on a cache miss.
+  - macOS builds it with clang. Windows builds it in MSYS2 `LITE_MSYSTEM`
+    (UCRT64; gcc, nasm, `-static`), set up only on a cache miss. Packages come
+    through `pacboy: gcc:p ...`, so changing `LITE_MSYSTEM` is enough.
+  - The script recognises the environment through `uname -s` (`UCRT64_NT-*` or
+    `MINGW64_NT-*`). A new environment has to be added to its `case`.
   - Output goes to `vendor/ffmpeg-lite/`, cached by `actions/cache` under a key
-    of version + script hash.
+    of version + script hash (+ `LITE_MSYSTEM` on Windows).
   - `.gitattributes` forces LF on `*.sh`; with CRLF from the Windows checkout,
     MSYS2 bash cannot run the script.
   - Never `--disable-x86asm`: with inline asm still on, swscale writes garbled
@@ -83,6 +88,14 @@ Both variants then run `smoke_test_ffmpeg.py vendor/ffmpeg[.exe]`.
 - The folder holds the notices from `licenses/THIRD-PARTY-NOTICES.template.txt`,
   the `licenses/ffmpeg/` texts, `ffmpeg -version`, and the Pillow and Python
   licenses.
+- For a Windows ffmpeg (`--ffmpeg *.exe`) it also copies `licenses/mingw-w64/`
+  (the MinGW-w64 runtime and winpthreads notices). Both Windows builds use
+  MinGW-w64 and statically link parts of those libraries; the lite exe contains
+  winpthreads symbols even with `--enable-w32threads`.
+  - The texts are from MSYS2 `crt` / `winpthreads` 14.0.0 (signature-verified),
+    unchanged since 13.0.
+  - `licenses/ffmpeg/` is verbatim FFmpeg 7.1. In 7.1.5 the only difference is
+    that `COPYING.LGPLv2.1` lacks the form feeds.
 - It is embedded with `--add-data`, copied into the `.dmg` as `Licenses`, and
   uploaded as the `notices-<platform><suffix>` artifact.
 - Before tagging, `release` zips those artifacts into `...-licenses.zip`. It then
@@ -130,7 +143,8 @@ step using secrets.
   This is slow: it runs two PyInstaller builds.
 - **Smoke test any ffmpeg**: `python .github/scripts/smoke_test_ffmpeg.py <path-to-ffmpeg>`.
 - **Lite build locally**:
-  - Run it from an MSYS2 MINGW64 shell. The work dir is `./build/ffmpeg-lite`.
+  - Run it from an MSYS2 UCRT64 or MINGW64 shell. The owner's local MSYS2 has
+    only the MINGW64 toolchain. The work dir is `./build/ffmpeg-lite`.
     It has only been tried from a path without spaces, and the repo path has
     one, so run it from a scratch dir.
   - Use MSYS2's own `make`. The native `mingw32-make` truncates the long `ar`

@@ -261,6 +261,10 @@ jobs:
             suffix: "-lite"
     env:
       SUFFIX: ${{ matrix.suffix }}
+      # MSYS2 environment the lite ffmpeg is compiled in. It is part of the cache
+      # key, so changing it rebuilds instead of reusing a binary from another
+      # toolchain; pacboy below resolves the package names for it.
+      LITE_MSYSTEM: UCRT64
     steps:
       - uses: actions/checkout@v6
 
@@ -286,18 +290,16 @@ jobs:
         uses: actions/cache@v6
         with:
           path: vendor/ffmpeg-lite
-          key: ffmpeg-lite-windows-x64-${{ env.FFMPEG_LITE_VERSION }}-${{ hashFiles('.github/scripts/build-ffmpeg-lite.sh') }}
+          key: ffmpeg-lite-windows-x64-${{ env.LITE_MSYSTEM }}-${{ env.FFMPEG_LITE_VERSION }}-${{ hashFiles('.github/scripts/build-ffmpeg-lite.sh') }}
 
       - name: Set up MSYS2 for the lite ffmpeg build
         if: matrix.variant == 'lite' && steps.lite-cache.outputs.cache-hit != 'true'
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: ${{ env.LITE_MSYSTEM }}
           update: false
-          install: >-
-            make diffutils curl tar xz
-            mingw-w64-x86_64-gcc mingw-w64-x86_64-nasm
-            mingw-w64-x86_64-pkgconf mingw-w64-x86_64-zlib
+          install: make diffutils curl tar xz
+          pacboy: gcc:p nasm:p pkgconf:p zlib:p
 
       - name: Build the lite ffmpeg
         if: matrix.variant == 'lite' && steps.lite-cache.outputs.cache-hit != 'true'

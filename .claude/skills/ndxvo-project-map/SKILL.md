@@ -30,7 +30,7 @@ ffmpeg inside. GUI text is English; the owner talks to Claude in Polish.
 | `.github/scripts/build-ffmpeg-lite.sh` | compiles the minimal LGPL ffmpeg for the `-lite` variant (component lists live here) |
 | `.github/scripts/smoke_test_ffmpeg.py` | runs the app's own probe/preview/export commands against a given ffmpeg |
 | `.github/scripts/collect_licenses.py` | assembles the third-party license folder (GPL or LGPL ffmpeg, Pillow, Python) for each build |
-| `licenses/` | notices template plus FFmpeg's license texts, copied verbatim from the source release |
+| `licenses/` | notices template, FFmpeg's license texts (verbatim from the 7.1 release) and the MinGW-w64 runtime / winpthreads notices for Windows builds |
 | `.github/workflows/claude.yml` | `@claude` in issues / PRs |
 | `tools/verify-ffmpeg-embedded.ps1` | local Windows proof that ffmpeg is inside the one-file exe |
 
