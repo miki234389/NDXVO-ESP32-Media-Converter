@@ -48,6 +48,18 @@ description: Use for anything about building and releasing the NDXVO converter -
 **ffmpeg** comes from the `imageio-ffmpeg` wheel, pinned by `IMAGEIO_FFMPEG_VERSION`.
 The same pin is duplicated in `tools/verify-ffmpeg-embedded.ps1`; keep them in sync.
 
+**Licenses (GPL)**: both bundled ffmpeg builds are GPL (Windows GPLv3, macOS
+GPLv2+). Each build job runs `collect_licenses.py` into `vendor/licenses`
+(notices from `licenses/THIRD-PARTY-NOTICES.template.txt`, `licenses/ffmpeg/`
+texts, `ffmpeg -version`, Pillow and Python licenses). That folder is embedded
+with `--add-data`, copied into the `.dmg` as `Licenses`, and uploaded as the
+`notices-<platform>` artifact. `release` zips those artifacts into
+`...-licenses.zip`, then fetches `ffmpeg-$FFMPEG_SOURCE_VERSION.tar.xz` and
+checks `FFMPEG_SOURCE_SHA256`. It does both before tagging. The script fails on
+a version mismatch or on `--enable-nonfree`, so a bump of
+`IMAGEIO_FFMPEG_VERSION` must also update `FFMPEG_SOURCE_VERSION`, the SHA and
+`licenses/ffmpeg/`.
+
 At runtime, `find_ffmpeg` searches `sys._MEIPASS` (the onefile temp dir, or
 `Contents/Frameworks` in a PyInstaller 6 `.app`), then the exe dir and
 `Contents/Resources`, then PATH and Homebrew. Pull it with

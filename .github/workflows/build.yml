@@ -23,6 +23,12 @@ env:
   # Static ffmpeg comes from the imageio-ffmpeg wheels: one pinned version,
   # native binaries for both targets, no scraping of ad-hoc download pages.
   IMAGEIO_FFMPEG_VERSION: "0.6.0"
+  # The FFmpeg release those binaries were built from. The bundled ffmpeg is
+  # GPL, so this source tarball is attached to every Release; collect_licenses.py
+  # fails the build if the binary is a different version. Bump all three together
+  # (the checksum is from https://ffmpeg.org/releases/, signature-verified).
+  FFMPEG_SOURCE_VERSION: "7.1"
+  FFMPEG_SOURCE_SHA256: "40973d44970dbc83ef302b0609f2e74982be2d85916dd2ee7472d30678a7abe6"
 
 jobs:
   # ------------------------------------------------------------ preflight ---
@@ -101,12 +107,24 @@ jobs:
           file vendor/ffmpeg
           vendor/ffmpeg -version | head -1
 
+      - name: Collect third-party licenses
+        run: |
+          python .github/scripts/collect_licenses.py \
+            --ffmpeg vendor/ffmpeg \
+            --platform "macOS arm64" \
+            --app-version "${{ needs.preflight.outputs.version }}" \
+            --ffmpeg-source-version "$FFMPEG_SOURCE_VERSION" \
+            --imageio-ffmpeg-version "$IMAGEIO_FFMPEG_VERSION" \
+            --release-url "${{ github.server_url }}/${{ github.repository }}/releases/tag/v${{ needs.preflight.outputs.version }}" \
+            --out vendor/licenses
+
       - name: Build the .app bundle
         run: |
           pyinstaller --noconfirm --clean --windowed --onedir \
             --name "$APP_NAME" \
             --osx-bundle-identifier "net.ndxvo.esp32converter" \
             --add-binary "vendor/ffmpeg:." \
+            --add-data "vendor/licenses:licenses" \
             --hidden-import "PIL._tkinter_finder" \
             ndxvo_converter.py
 
@@ -132,6 +150,7 @@ jobs:
           V="${{ needs.preflight.outputs.version }}"
           mkdir -p dmg out
           cp -R "dist/$APP_NAME.app" dmg/
+          cp -R vendor/licenses "dmg/Licenses"
           ln -s /Applications "dmg/Applications"
           hdiutil create -volname "$APP_NAME" -srcfolder dmg -ov -format UDZO \
             "out/NDXVO-Media-Converter-$V-macOS-arm64.dmg"
@@ -154,6 +173,13 @@ jobs:
           fi
           echo "Bundled ffmpeg: $(stat -f%z "$FF") bytes"
           "$FF" -version | head -1
+          if [ ! -f "$MP/Licenses/THIRD-PARTY-NOTICES.txt" ] ||
+             [ -z "$(find "$MP/$APP_NAME.app" -path '*/licenses/THIRD-PARTY-NOTICES.txt' | head -n 1)" ]; then
+            echo "::error::The license notices are missing from the .dmg or from the app bundle"
+            hdiutil detach "$MP" || true
+            exit 1
+          fi
+          echo "License notices are in the .dmg and in the app bundle."
           echo "App bundle total: $(du -sh "$MP/$APP_NAME.app" | cut -f1)"
           hdiutil detach "$MP"
 
@@ -161,6 +187,11 @@ jobs:
         with:
           name: macos-arm64-dmg-${{ needs.preflight.outputs.version }}
           path: "out/*.dmg"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: notices-macos-arm64
+          path: vendor/licenses
 
   # -------------------------------------------------------------- Windows ---
   windows:
@@ -190,11 +221,24 @@ jobs:
           Copy-Item $ff vendor\ffmpeg.exe
           .\vendor\ffmpeg.exe -version | Select-Object -First 1
 
+      - name: Collect third-party licenses
+        shell: bash
+        run: |
+          python .github/scripts/collect_licenses.py \
+            --ffmpeg vendor/ffmpeg.exe \
+            --platform "Windows x64" \
+            --app-version "${{ needs.preflight.outputs.version }}" \
+            --ffmpeg-source-version "$FFMPEG_SOURCE_VERSION" \
+            --imageio-ffmpeg-version "$IMAGEIO_FFMPEG_VERSION" \
+            --release-url "${{ github.server_url }}/${{ github.repository }}/releases/tag/v${{ needs.preflight.outputs.version }}" \
+            --out vendor/licenses
+
       - name: Build the .exe
         run: |
           pyinstaller --noconfirm --clean --windowed --onefile `
             --name "$env:APP_NAME" `
             --add-binary "vendor/ffmpeg.exe;." `
+            --add-data "vendor/licenses;licenses" `
             --hidden-import "PIL._tkinter_finder" `
             ndxvo_converter.py
 
@@ -213,15 +257,23 @@ jobs:
         run: |
           EXE="out/NDXVO-Media-Converter-${{ needs.preflight.outputs.version }}-Windows-x64.exe"
           ls -l "$EXE"
-          python -m PyInstaller.utils.cliutils.archive_viewer --list --brief "$EXE" \
-            | tr ',' '\n' | grep -qi 'ffmpeg\.exe' \
+          LISTING="$(python -m PyInstaller.utils.cliutils.archive_viewer --list --brief "$EXE" | tr ',' '\n')"
+          echo "$LISTING" | grep -qi 'ffmpeg\.exe' \
             || { echo "::error::ffmpeg.exe is NOT embedded in the one-file .exe"; exit 1; }
           echo "ffmpeg.exe is embedded in the one-file executable."
+          echo "$LISTING" | grep -qiE 'licenses[\\/]+THIRD-PARTY-NOTICES\.txt' \
+            || { echo "::error::The license notices are NOT embedded in the one-file .exe"; exit 1; }
+          echo "License notices are embedded in the one-file executable."
 
       - uses: actions/upload-artifact@v7
         with:
           name: windows-x64-exe-${{ needs.preflight.outputs.version }}
           path: "out/*.exe"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: notices-windows-x64
+          path: vendor/licenses
 
   # -------------------------------------------------------------- release ---
   # Runs only after BOTH builds succeed, so a tag is never created for a version
@@ -236,10 +288,34 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: actions/download-artifact@v7
+      - name: Download the binaries
+        uses: actions/download-artifact@v7
         with:
+          # Binary artifacts end in -<version>; the notices-* ones do not, and
+          # are zipped separately below.
+          pattern: "*-${{ needs.preflight.outputs.version }}"
           path: assets
           merge-multiple: true
+
+      - name: Download the license notices
+        uses: actions/download-artifact@v7
+        with:
+          pattern: "notices-*"
+          path: notices
+
+      - name: Attach the license notices and the FFmpeg source
+        # The bundled ffmpeg is GPL: its license texts and its source code have
+        # to be offered from the same place as the binaries. This runs before
+        # the tag is created, so a failed download never leaves a tag behind.
+        run: |
+          V="${{ needs.preflight.outputs.version }}"
+          cd notices
+          for d in notices-*; do mv "$d" "${d#notices-}"; done
+          zip -qr "../assets/NDXVO-Media-Converter-$V-licenses.zip" .
+          cd ..
+          TARBALL="ffmpeg-$FFMPEG_SOURCE_VERSION.tar.xz"
+          curl -fsSL --retry 3 -o "assets/$TARBALL" "https://ffmpeg.org/releases/$TARBALL"
+          echo "$FFMPEG_SOURCE_SHA256  assets/$TARBALL" | sha256sum -c -
 
       - name: Show what will be published
         run: ls -la assets
@@ -262,3 +338,8 @@ jobs:
           name: "v${{ needs.preflight.outputs.version }}"
           files: assets/*
           fail_on_unmatched_files: true
+          body: |
+            Both builds bundle FFmpeg ${{ env.FFMPEG_SOURCE_VERSION }}, which is licensed under the GPL. The converter runs it as a separate program.
+
+            - License texts and build details: `NDXVO-Media-Converter-${{ needs.preflight.outputs.version }}-licenses.zip` (on macOS also in the `Licenses` folder of the .dmg)
+            - FFmpeg source code: `ffmpeg-${{ env.FFMPEG_SOURCE_VERSION }}.tar.xz`

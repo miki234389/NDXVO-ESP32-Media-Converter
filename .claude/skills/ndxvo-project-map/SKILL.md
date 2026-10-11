@@ -27,6 +27,8 @@ ffmpeg inside. GUI text is English; the owner talks to Claude in Polish.
 | `.github/workflows/build.yml` | preflight -> macos + windows -> release |
 | `.github/scripts/resolve-version.sh` | picks and validates the version (form input or tag) |
 | `.github/scripts/stamp_version.py` | rewrites the `APP_VERSION = "..."` line before packaging |
+| `.github/scripts/collect_licenses.py` | assembles the third-party license folder (GPL ffmpeg, Pillow, Python) for each build |
+| `licenses/` | notices template plus FFmpeg's license texts, copied verbatim from the source release |
 | `.github/workflows/claude.yml` | `@claude` in issues / PRs |
 | `tools/verify-ffmpeg-embedded.ps1` | local Windows proof that ffmpeg is inside the one-file exe |
 

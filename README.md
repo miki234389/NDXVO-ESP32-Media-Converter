@@ -154,6 +154,10 @@ Each target bundles a static ffmpeg, so end users install nothing. ffmpeg is
 staged into `vendor/` and finished binaries into `out/`, so the upload globs
 cannot pick up build inputs by accident.
 
+Besides the two binaries, every Release carries
+`NDXVO-Media-Converter-<version>-licenses.zip` and the FFmpeg source tarball —
+see [Licenses](#licenses).
+
 Artifacts are uploaded with `archive: false`, so the download is the `.dmg` or
 `.exe` itself rather than a zip wrapping it. This works because each job
 produces exactly one file — if a build ever emits more than one, the upload
@@ -178,6 +182,33 @@ To remove this step entirely you need an Apple Developer ID ($99/year) and a
 notarisation step in the workflow. The workflow is structured so that adding it
 later is a matter of supplying the certificate and credentials as repository
 secrets — no restructuring required.
+
+### Licenses
+
+The bundled ffmpeg is a GPL build: GPLv3 on Windows (the gyan.dev "essentials"
+build), GPLv2-or-later on macOS, both taken from the pinned imageio-ffmpeg
+wheel. The converter only starts it as a separate process, so its own code is
+not covered by the GPL — but every binary handed to someone must come with the
+GPL text and the ffmpeg source code. The build takes care of that:
+
+- `.github/scripts/collect_licenses.py` assembles one folder:
+  `THIRD-PARTY-NOTICES.txt` (rendered from
+  `licenses/THIRD-PARTY-NOTICES.template.txt`), FFmpeg's own license files
+  (`licenses/ffmpeg/`, copied verbatim from the FFmpeg 7.1 source release), the
+  bundled binary's full `ffmpeg -version` output, and the Pillow and Python
+  licenses.
+- That folder is embedded in both apps and copied into the `.dmg` as `Licenses`.
+- The `release` job zips the folders from both platforms into
+  `NDXVO-Media-Converter-<version>-licenses.zip`, downloads
+  `ffmpeg-<FFMPEG_SOURCE_VERSION>.tar.xz` from ffmpeg.org, checks it against
+  `FFMPEG_SOURCE_SHA256` and attaches both to the Release, before the tag is
+  created.
+
+The build fails if the bundled ffmpeg is not the release named in
+`FFMPEG_SOURCE_VERSION`, or if it was built with `--enable-nonfree` (such a
+build may not be redistributed at all). When you bump `IMAGEIO_FFMPEG_VERSION`,
+update `FFMPEG_SOURCE_VERSION` and `FFMPEG_SOURCE_SHA256` with it, and refresh
+`licenses/ffmpeg/` from the new source tarball.
 
 ---
 

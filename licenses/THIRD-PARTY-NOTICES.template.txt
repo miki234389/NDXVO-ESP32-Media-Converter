@@ -1,0 +1,65 @@
+NDXVO Media Converter ${app_version} (${platform}) - third-party notices
+==============================================================================
+
+This application bundles the components listed below. Each one is distributed
+under its own license; the full license texts are in the folders next to this
+file.
+
+
+FFmpeg ${ffmpeg_version}
+------------------------------------------------------------------------------
+License:  ${ffmpeg_license}
+Text:     ${ffmpeg_license_file}
+          (ffmpeg/LICENSE.md explains how FFmpeg is licensed; the other
+          COPYING files are included because it refers to them)
+Build:    ffmpeg/BUILD-INFO.txt - the full "ffmpeg -version" output of the
+          bundled binary, including every configure flag
+Origin:   ${ffmpeg_origin}
+
+FFmpeg is a separate program. NDXVO Media Converter starts it as an external
+process and does not link against it, so the converter's own code is not
+covered by the GPL. The bundled copy can be replaced with any other ffmpeg
+build from the ffmpeg row in the app.
+
+Source code: the binary was built from the FFmpeg ${ffmpeg_source_version} release. That
+source code is attached to the GitHub Release this application is published
+on, as ${ffmpeg_tarball}:
+
+    ${release_url}
+
+It is also available from the FFmpeg project:
+
+    https://ffmpeg.org/releases/${ffmpeg_tarball}
+
+The binary is statically linked with further free libraries (x264, x265,
+libvpx and others, listed in BUILD-INFO.txt); their source code is available
+from the respective projects.
+
+
+Pillow ${pillow_version}
+------------------------------------------------------------------------------
+License:  ${pillow_license}
+Text:     Pillow/LICENSE.txt (also covers the libraries bundled in the Pillow
+          wheel, such as libjpeg-turbo, zlib, libpng and FreeType)
+Source:   https://github.com/python-pillow/Pillow
+
+
+Python ${python_version}
+------------------------------------------------------------------------------
+License:  Python Software Foundation License Version 2
+Text:     ${python_license_file}
+Source:   https://www.python.org/downloads/source/
+
+
+Tcl/Tk ${tcl_version} (used through Python's tkinter)
+------------------------------------------------------------------------------
+License:  Tcl/Tk license (BSD-style)
+Text:     https://www.tcl-lang.org/software/tcltk/license.html
+
+
+PyInstaller ${pyinstaller_version} bootloader
+------------------------------------------------------------------------------
+License:  GPL-2.0-or-later with the PyInstaller bootloader exception, which
+          allows applications bundled with it to be distributed under any
+          license
+Source:   https://github.com/pyinstaller/pyinstaller
