@@ -4,6 +4,8 @@ A single-file GUI that turns any video or still image into an MJPEG-AVI clip, or
 a single JPEG, that an ESP32 device with a 172 × 320 panel shows straight from
 an SD card.
 
+![NDXVO Media Converter: the source frame, the device preview and the settings, with the ffmpeg command below](docs/screenshot.png)
+
 It is a graphical superset of this command:
 
 ```
